@@ -1,8 +1,8 @@
 streamlit
 pandas
 requests
+gspread
+google-auth
 pyzbar
 Pillow
-recipe-scrapers
-gspread
-deep-translator
+plotly

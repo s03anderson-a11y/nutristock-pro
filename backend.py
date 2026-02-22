@@ -3,6 +3,7 @@ import requests
 import json
 import gspread
 import streamlit as st
+import difflib
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 from deep_translator import GoogleTranslator
@@ -50,11 +51,16 @@ def init_dbs():
     def init_tab(name, cols):
         try:
             worksheet = sheet.worksheet(name)
-            if not worksheet.get_all_values(): 
-                worksheet.append_row(cols)
+            # FIX: Sicherer Check, um APIError bei komplett leeren Tabellen zu vermeiden
+            try:
+                headers = worksheet.row_values(1)
+                if not headers:
+                    worksheet.insert_row(cols, index=1)
+            except:
+                worksheet.insert_row(cols, index=1)
         except gspread.WorksheetNotFound:
             worksheet = sheet.add_worksheet(title=name, rows="100", cols="50")
-            worksheet.append_row(cols)
+            worksheet.insert_row(cols, index=1)
 
     init_tab(LIB_FILE, ["Name", "Marke", "Kategorie", "Menge_Std", "Einheit_Std", "Preis"] + ALL_NUTRIENTS)
     init_tab(DB_FILE, ["Name", "Marke", "Menge", "Einheit", "Preis", "MHD"] + ALL_NUTRIENTS)
@@ -64,18 +70,22 @@ def init_dbs():
     st.session_state.dbs_initialized = True
 
 def load_data(sheet_name):
-    sheet = get_sheet().worksheet(sheet_name)
-    records = sheet.get_all_records()
-    headers = sheet.row_values(1)
-    
-    if not records:
-        return pd.DataFrame(columns=headers)
+    try:
+        sheet = get_sheet().worksheet(sheet_name)
+        records = sheet.get_all_records()
+        headers = sheet.row_values(1)
         
-    df = pd.DataFrame(records)
-    for col in headers:
-        if col not in df.columns:
-            df[col] = ""
-    return df
+        if not records:
+            return pd.DataFrame(columns=headers)
+            
+        df = pd.DataFrame(records)
+        for col in headers:
+            if col not in df.columns:
+                df[col] = ""
+        return df
+    except Exception as e:
+        print(f"Fehler beim Laden von {sheet_name}: {e}")
+        return pd.DataFrame()
 
 def save_data(df, sheet_name):
     if "Status" in df.columns:
@@ -105,7 +115,15 @@ def from_grams(menge_g, ziel_einheit):
     if ziel_einheit in ["kg", "L"]: return float(menge_g) / 1000.0
     return float(menge_g)
 
-# --- NEU: ÜBERSETZER & USDA API ---
+# --- INTELLIGENTE SUCHE (FUZZY MATCHING 70%) ---
+def is_fuzzy_match(search_term, target_term, threshold=0.7):
+    s1, s2 = str(search_term).lower(), str(target_term).lower()
+    if s1 in s2 or s2 in s1: 
+        return True
+    ratio = difflib.SequenceMatcher(None, s1, s2).ratio()
+    return ratio >= threshold
+
+# --- ÜBERSETZER & USDA API ---
 def translate_de_to_en(text):
     try:
         return GoogleTranslator(source='de', target='en').translate(text)
@@ -189,15 +207,43 @@ def check_pantry(recipe_items_list, inv_df):
     for item in recipe_items_list:
         if item.get("Is_Joker", False):
             continue
+        
         req_g = to_grams(item["Menge"], item["Einheit"])
-        match = inv_df[inv_df["Name"].str.contains(item["Name"], case=False, na=False)]
-        if not match.empty:
-            avail_g = sum([to_grams(row["Menge"], row["Einheit"]) for _, row in match.iterrows()])
-            if avail_g >= req_g:
-                results.append({"Zutat": item["Name"], "Status": "🟢 Auf Lager", "Fehlt": "0"})
-            else:
-                fehl_g = req_g - avail_g
-                results.append({"Zutat": item["Name"], "Status": "🟡 Teilweise", "Fehlt": f"{from_grams(fehl_g, item['Einheit']):.2f} {item['Einheit']}"})
+        avail_g = 0.0
+        
+        # Nutzen der neuen 70% Fuzzy Search Logik
+        for _, row in inv_df.iterrows():
+            if is_fuzzy_match(item["Name"], row["Name"]):
+                avail_g += to_grams(row["Menge"], row["Einheit"])
+                
+        if avail_g >= req_g:
+            results.append({"Zutat": item["Name"], "Status": "🟢 Auf Lager", "Fehlt": "0"})
+        elif avail_g > 0:
+            fehl_g = req_g - avail_g
+            results.append({"Zutat": item["Name"], "Status": "🟡 Teilweise", "Fehlt": f"{from_grams(fehl_g, item['Einheit']):.2f} {item['Einheit']}"})
         else:
             results.append({"Zutat": item["Name"], "Status": "🔴 Fehlt komplett", "Fehlt": f"{item['Menge']} {item['Einheit']}"})
+            
     return pd.DataFrame(results)
+
+def deduct_cooked_recipe_from_inventory(recipe_items_list, inv_df):
+    """Zieht Zutaten intelligent (Fuzzy Match) nach dem Kochen ab."""
+    for item in recipe_items_list:
+        if item.get("Is_Joker", False):
+            continue
+            
+        req_g = to_grams(item["Menge"], item["Einheit"])
+        
+        for idx, row in inv_df.iterrows():
+            if req_g <= 0: break # Wenn Zutat gedeckt ist, abbrechen
+            
+            if is_fuzzy_match(item["Name"], row["Name"]):
+                akt_menge_g = to_grams(row["Menge"], row["Einheit"])
+                if akt_menge_g > 0:
+                    abzug_g = min(req_g, akt_menge_g)
+                    neu_menge_g = akt_menge_g - abzug_g
+                    req_g -= abzug_g
+                    
+                    inv_df.at[idx, "Menge"] = from_grams(neu_menge_g, row["Einheit"])
+                    log_history("Gekocht (Abbuchung)", row["Name"], row["Marke"], -from_grams(abzug_g, row["Einheit"]), row["Einheit"], 0)
+    return inv_df

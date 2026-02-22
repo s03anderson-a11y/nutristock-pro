@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 # ==========================================
 DB_FILE, LIB_FILE, RECIPE_FILE, HISTORY_FILE = "Vorrat", "Bibliothek", "Rezepte", "Historie"
 
-# NEU: Die "Big 7" EU-Deklaration bei den Makronährstoffen
 NUTRIENTS = {
     "Makronährstoffe": ["kcal_100", "Fett_100", "Fett_Sat_100", "Carb_100", "Zucker_100", "Prot_100"],
     "Vitamine": ["Vit_A", "Vit_D", "Vit_E", "Vit_K", "Vit_C", "B1", "B2", "B3", "B5", "B6", "B7", "B9", "B12"],
@@ -21,11 +20,11 @@ NUTRIENTS = {
 ALL_NUTRIENTS = [item for sub in NUTRIENTS.values() for item in sub]
 UNITS = ["g", "kg", "ml", "L", "Stk."]
 
-# Gewichts-Intuition
 STD_WEIGHTS = {"zitrone": 60, "ei": 55, "apfel": 150, "banane": 120, "zwiebel": 80, "knoblauch": 5, "kartoffel": 100, "orange": 200, "tomate": 80}
 
-# Smart MHD Buffer in Tagen
-MHD_DEFAULTS = {"Selbstgekocht": 4, "Fleisch": 3, "Fisch": 2, "Gemüse": 7, "Obst": 7, "Milchprodukte": 10, "Getreide": 180, "Konserve": 365, "Allgemein": 14}
+# Erweiterte Kategorien für den Alltag
+KATEGORIEN = ["Gemüse", "Obst", "Milchprodukte", "Fleisch", "Fisch", "Getreide", "Konserve", "Snacks", "Getränke", "Gewürze/Saucen", "Selbstgekocht", "Allgemein"]
+MHD_DEFAULTS = {"Selbstgekocht": 4, "Fleisch": 3, "Fisch": 2, "Gemüse": 7, "Obst": 7, "Milchprodukte": 10, "Getreide": 180, "Konserve": 365, "Snacks": 180, "Getränke": 180, "Gewürze/Saucen": 365, "Allgemein": 14}
 
 # ==========================================
 # GOOGLE SHEETS VERBINDUNG & DB SETUP
@@ -59,7 +58,7 @@ def load_data(sheet_name):
     try:
         ws = get_sheet().worksheet(sheet_name)
         records = ws.get_all_records()
-        return pd.DataFrame(records) if records else pd.DataFrame(columns=ws.row_values(1))
+        return pd.DataFrame(records).fillna(0.0) if records else pd.DataFrame(columns=ws.row_values(1))
     except: return pd.DataFrame()
 
 def save_data(df, sheet_name):
@@ -92,16 +91,13 @@ def from_grams(m, e):
     except: return 0.0
 
 def predict_category(name):
-    cats = {"Gemüse": ["tomate", "gurke", "zwiebel", "gemüse", "kichererbse", "bohne", "spinat", "brokkoli"], "Obst": ["apfel", "banane", "zitrone", "beere", "frucht", "orange"], "Milchprodukte": ["milch", "käse", "joghurt", "quark", "sahne"], "Fleisch": ["huhn", "rind", "schwein", "fleisch", "wurst"], "Fisch": ["lachs", "thunfisch", "fisch"], "Getreide": ["nudel", "reis", "mehl", "brot", "hafer"], "Konserve": ["dose", "konserve"], "Selbstgekocht": ["vorbereitet", "selbstgemacht", "mealprep"]}
+    cats = {"Gemüse": ["tomate", "gurke", "zwiebel", "gemüse", "kichererbse", "bohne", "spinat", "brokkoli"], "Obst": ["apfel", "banane", "zitrone", "beere", "frucht", "orange"], "Milchprodukte": ["milch", "käse", "joghurt", "quark", "sahne"], "Fleisch": ["huhn", "rind", "schwein", "fleisch", "wurst"], "Fisch": ["lachs", "thunfisch", "fisch"], "Getreide": ["nudel", "reis", "mehl", "brot", "hafer"], "Konserve": ["dose", "konserve"], "Snacks": ["riegel", "chips", "schokolade", "snack"], "Getränke": ["wasser", "saft", "cola", "getränk"], "Gewürze/Saucen": ["salz", "pfeffer", "sauce", "ketchup", "öl", "essig"]}
     for c, words in cats.items():
         if any(w in str(name).lower() for w in words): return c
     return "Allgemein"
 
-def get_mhd_default(cat): 
-    return datetime.now() + timedelta(days=MHD_DEFAULTS.get(cat, 14))
-
 # ==========================================
-# API ENGINE (Mit EU-Makros: Zucker & ges. Fette)
+# API ENGINE
 # ==========================================
 def fetch_comprehensive_data(barcode, api_key):
     data = {"Name": "", "Marke": "", "nutrients": {n: 0.0 for n in ALL_NUTRIENTS}}
@@ -111,12 +107,9 @@ def fetch_comprehensive_data(barcode, api_key):
             p, n = off["product"], off["product"].get("nutriments", {})
             data["Name"], data["Marke"] = p.get("product_name", ""), p.get("brands", "")
             data["nutrients"].update({
-                "kcal_100": n.get("energy-kcal_100g", 0), 
-                "Fett_100": n.get("fat_100g", 0), 
-                "Fett_Sat_100": n.get("saturated-fat_100g", 0), 
-                "Carb_100": n.get("carbohydrates_100g", 0), 
-                "Zucker_100": n.get("sugars_100g", 0), 
-                "Prot_100": n.get("proteins_100g", 0),
+                "kcal_100": n.get("energy-kcal_100g", 0), "Fett_100": n.get("fat_100g", 0), 
+                "Fett_Sat_100": n.get("saturated-fat_100g", 0), "Carb_100": n.get("carbohydrates_100g", 0), 
+                "Zucker_100": n.get("sugars_100g", 0), "Prot_100": n.get("proteins_100g", 0),
                 "Natrium": n.get("sodium_100g", 0) * 1000
             })
     except: pass
@@ -133,18 +126,10 @@ def get_usda_data(query, api_key):
         r = requests.get(f"https://api.nal.usda.gov/fdc/v1/foods/search?api_key={api_key}&query={query}&dataType=Foundation,SR%20Legacy&pageSize=1", timeout=10).json()
         if r.get("foods"):
             det = requests.get(f"https://api.nal.usda.gov/fdc/v1/food/{r['foods'][0]['fdcId']}?api_key={api_key}", timeout=10).json()
-            # Ergänzt um 1258 (gesättigte Fette) und 2000 (Zucker)
-            u_map = {
-                1008: "kcal_100", 1003: "Prot_100", 1004: "Fett_100", 1258: "Fett_Sat_100", 
-                1005: "Carb_100", 2000: "Zucker_100", 1087: "Calcium", 1089: "Eisen", 
-                1090: "Magnesium", 1091: "Phosphor", 1092: "Kalium", 1093: "Natrium", 
-                1095: "Zink", 1162: "Vit_C", 1106: "Vit_A", 1109: "Vit_E", 1114: "Vit_D", 
-                1165: "B1", 1166: "B2", 1167: "B3", 1170: "B5", 1175: "B6", 1177: "B9", 1178: "B12"
-            }
+            u_map = {1008: "kcal_100", 1003: "Prot_100", 1004: "Fett_100", 1258: "Fett_Sat_100", 1005: "Carb_100", 2000: "Zucker_100", 1087: "Calcium", 1089: "Eisen", 1090: "Magnesium", 1091: "Phosphor", 1092: "Kalium", 1093: "Natrium", 1095: "Zink", 1162: "Vit_C", 1106: "Vit_A", 1109: "Vit_E", 1114: "Vit_D", 1165: "B1", 1166: "B2", 1167: "B3", 1170: "B5", 1175: "B6", 1177: "B9", 1178: "B12"}
             res = {}
             for n in det.get("foodNutrients", []):
-                if n.get("nutrient", {}).get("id") in u_map: 
-                    res[u_map[n["nutrient"]["id"]]] = float(n.get("amount", 0.0))
+                if n.get("nutrient", {}).get("id") in u_map: res[u_map[n["nutrient"]["id"]]] = float(n.get("amount", 0.0))
             return res
     except: pass
     return {}
@@ -160,18 +145,17 @@ def add_to_inventory(inv_df, entry):
         new_g = to_grams(entry["Menge"], entry["Einheit"], entry["Name"])
         inv_df.at[idx, "Menge"] = from_grams(old_g + new_g, inv_df.at[idx, "Einheit"])
         inv_df.at[idx, "Preis"] = float(inv_df.at[idx, "Preis"]) + float(entry["Preis"])
-        inv_df.at[idx, "MHD"] = entry["MHD"]
+        # MHD wird auf das neuere/längere gesetzt
+        inv_df.at[idx, "MHD"] = max(str(inv_df.at[idx, "MHD"]), str(entry["MHD"]))
     else: inv_df = pd.concat([inv_df, pd.DataFrame([entry])], ignore_index=True)
     return inv_df
 
-def delete_inventory_item(inv_df, index):
-    return inv_df.drop(index).reset_index(drop=True)
+def delete_inventory_item(inv_df, index): return inv_df.drop(index).reset_index(drop=True)
 
 def update_inventory_item(inv_df, index, new_menge):
-    old_menge = inv_df.at[index, "Menge"]
+    old_menge = float(inv_df.at[index, "Menge"])
     inv_df.at[index, "Menge"] = new_menge
-    if float(old_menge) > 0:
-        inv_df.at[index, "Preis"] = (float(inv_df.at[index, "Preis"]) / float(old_menge)) * float(new_menge)
+    if old_menge > 0: inv_df.at[index, "Preis"] = (float(inv_df.at[index, "Preis"]) / old_menge) * float(new_menge)
     return inv_df
 
 def calculate_recipe_totals(zutaten_liste):

@@ -438,8 +438,19 @@ elif menu == "📥 Lebensmittel aufnehmen":
                 sel_usda = st.selectbox("Ergebnisse:", list(options.keys()), key="usda_dropdown")
                 if st.button("⬇️ Mikronährstoffe laden", key="usda_load_btn"):
                     with st.spinner("Lade USDA Daten..."):
-                        st.session_state.usda_micros = get_usda_micros(options[sel_usda], st.secrets["usda_api_key"])
-                        st.success("✅ Werte im Formular vorausgefüllt.")
+                        # 1. Daten von USDA holen
+                        micros = get_usda_micros(options[sel_usda], st.secrets["usda_api_key"])
+                        st.session_state.usda_micros = micros
+                        
+                        # 2. Streamlit ZWINGEN, die Felder mit den neuen Werten zu überschreiben
+                        for c_name, val in micros.items():
+                            state_key = f"scan_nutri_{c_name}"
+                            # Wir schreiben den Wert direkt in den Streamlit-Zwischenspeicher
+                            st.session_state[state_key] = float(val)
+                            
+                        st.success("✅ Werte erfolgreich in die Matrix geladen!")
+                        # 3. WICHTIG: Seite sofort neu laden, damit die Zahlen sichtbar werden
+                        st.rerun()
 
         # Das finale Speichern-Formular
         if data or barcode_value: 
@@ -716,3 +727,4 @@ elif menu == "📚 Bibliothek (Stammdaten)":
                     st.rerun()
                 else: 
                     st.error("Bitte einen Namen vergeben!")
+

@@ -145,7 +145,7 @@ def translate_de_to_en(text):
         return text
 
 def search_usda(query, api_key):
-    url = f"https://api.nal.usda.gov/fdc/v1/foods/search?api_key={api_key}&query={query}&pageSize=15"
+    url = f"https://api.nal.usda.gov/fdc/v1/foods/search?api_key={api_key}&query={query}&dataType=Foundation,SR%20Legacy&pageSize=15"
     try:
         response = requests.get(url, timeout=10)
         if response.status_code == 200:

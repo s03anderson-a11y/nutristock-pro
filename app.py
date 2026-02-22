@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from backend import (
     DB_FILE, LIB_FILE, RECIPE_FILE, NUTRIENTS, ALL_NUTRIENTS, UNITS,
     init_dbs, load_data, save_data, to_grams, from_grams, log_history,
-    fetch_product_from_api, add_to_inventory, check_pantry,
+    fetch_product_from_api, add_to_inventory, check_pantry, deduct_cooked_recipe_from_inventory,
     translate_de_to_en, search_usda, get_usda_micros
 )
 
@@ -34,8 +34,6 @@ if "recipe_instructions" not in st.session_state: st.session_state.recipe_instru
 if "recipe_title" not in st.session_state: st.session_state.recipe_title = ""
 if "api_data" not in st.session_state: st.session_state.api_data = None
 if "last_barcode" not in st.session_state: st.session_state.last_barcode = ""
-
-# Session States für USDA
 if "usda_results" not in st.session_state: st.session_state.usda_results = []
 if "usda_micros" not in st.session_state: st.session_state.usda_micros = {}
 
@@ -128,7 +126,7 @@ if menu == "🍳 Meal Creator & Rezepte":
                 display_recipe.columns = ["Zutat", "Menge", "Einheit", "Kosten (€)", "Kcal"]
                 st.dataframe(display_recipe, use_container_width=True)
             with c_pantry:
-                st.write("**Vorrats-Abgleich:**")
+                st.write("**Vorrats-Abgleich (Intelligente 70% Suche):**")
                 st.dataframe(check_pantry(st.session_state.recipe_items, inv), use_container_width=True)
 
             with st.form("recipe_save_form"):
@@ -144,7 +142,6 @@ if menu == "🍳 Meal Creator & Rezepte":
                 totals = {n: df_rec[n].sum() for n in ALL_NUTRIENTS if n in df_rec.columns}
                 
                 st.write("---")
-                st.write("**Nährwert Vorschau (Auszug):**")
                 preview_data = {
                     "Messgröße": ["Gewicht (g)", "Kosten (€)", "Kcal", "Protein (g)", "Fett (g)", "Carbs (g)"],
                     "Gesamtes Rezept": [total_weight, total_price, totals.get("kcal_100", 0), totals.get("Prot_100", 0), totals.get("Fett_100", 0), totals.get("Carb_100", 0)],
@@ -206,7 +203,7 @@ if menu == "🍳 Meal Creator & Rezepte":
                 st.write("**Zubereitung:**")
                 st.write(rec_data.get("Zubereitung", "Keine Anleitung hinterlegt."))
             
-            view_mode = st.radio("Ansicht:", ["Gesamtes Rezept", "Pro Portion (1 Teller)", "Pro 100g"], horizontal=True)
+            view_mode = st.radio("Ansicht:", ["Gesamtes Rezept", "Pro Portion (1 Teller)", "Pro 100g"], horizontal=True, key="view_mode_cook")
             divisor = float(rec_data["Portionen"]) if view_mode == "Pro Portion (1 Teller)" else (float(rec_data["Gewicht_Gesamt"]) / 100.0 if float(rec_data["Gewicht_Gesamt"]) > 0 else 1) if view_mode == "Pro 100g" else 1.0
             
             tabs_r = st.tabs(list(NUTRIENTS.keys()))
@@ -219,19 +216,10 @@ if menu == "🍳 Meal Creator & Rezepte":
             
             st.divider()
             if st.button("🍳 Jetzt Kochen (Zutaten vom Vorrat abziehen)"):
-                for z in zutaten_liste:
-                    if not z.get("Is_Joker", False):
-                        mask = inv["Name"].str.contains(z["Name"], case=False, na=False)
-                        if mask.any():
-                            idx = inv[mask].index[0]
-                            akt_menge_g = to_grams(inv.at[idx, "Menge"], inv.at[idx, "Einheit"])
-                            neu_menge_g = max(0, akt_menge_g - z["Menge_Gramm"])
-                            abgezogen = from_grams(akt_menge_g - neu_menge_g, inv.at[idx, "Einheit"])
-                            inv.at[idx, "Menge"] = from_grams(neu_menge_g, inv.at[idx, "Einheit"])
-                            log_history("Gekocht (Abbuchung)", inv.at[idx, "Name"], inv.at[idx, "Marke"], -abgezogen, inv.at[idx, "Einheit"], 0)
-                
+                # NUTZT NUN DEN INTELLIGENTEN ABZUG (FUZZY MATCH)
+                inv = deduct_cooked_recipe_from_inventory(zutaten_liste, inv)
                 save_data(inv.drop(columns=["Status"], errors="ignore"), DB_FILE)
-                st.success("Zutaten wurden erfolgreich aus der Vorratskammer abgezogen! Guten Appetit!")
+                st.success("Zutaten wurden intelligent aus der Vorratskammer abgezogen! Guten Appetit!")
         else: st.info("Noch keine Rezepte gespeichert.")
 
 # ==========================================
@@ -246,7 +234,7 @@ elif menu == "📥 Lebensmittel aufnehmen":
     with tab_lib:
         if not lib.empty:
             lib_names = lib.apply(lambda x: f"{x['Name']} - {x['Marke']}" if pd.notna(x['Marke']) and str(x['Marke']).strip() else x['Name'], axis=1).tolist()
-            selected_match = st.selectbox("🔍 Produkt tippen zum Suchen:", options=["-- Bitte wählen --"] + lib_names)
+            selected_match = st.selectbox("🔍 Produkt tippen zum Suchen:", options=["-- Bitte wählen --"] + lib_names, key="lib_search")
             
             if selected_match != "-- Bitte wählen --":
                 sel_idx = lib_names.index(selected_match)
@@ -271,41 +259,28 @@ elif menu == "📥 Lebensmittel aufnehmen":
                         else: st.error("Bitte eine Menge größer als 0 eingeben!")
 
     with tab_scan:
-        scan_method = st.radio("Methode:", ["⌨️ Tastatur-Eingabe", "📷 Kamera-Scanner"])
+        # HIER IST DER FIX FÜR DEN RADIO-BUTTON-ERROR
+        scan_method = st.radio("Methode:", ["⌨️ Tastatur-Eingabe", "📷 Kamera-Scanner"], key="scan_radio")
         barcode_value = ""
         
         if scan_method == "⌨️ Tastatur-Eingabe":
-            barcode_value = st.text_input("Barcode tippen:")
-        # --- DIESER BLOCK ERSETZT DEINEN GEPOSTETEN CODE ---
-        scan_method = st.radio("Methode:", ["⌨️ Tastatur-Eingabe", "📷 Kamera-Scanner"])
-        barcode_value = ""
-        
-        if scan_method == "⌨️ Tastatur-Eingabe":
-            barcode_value = st.text_input("Barcode tippen:")
-            
+            barcode_value = st.text_input("Barcode tippen:", key="barcode_text_input")
         elif scan_method == "📷 Kamera-Scanner":
-            if not PYZBAR_AVAILABLE: 
-                st.error("⚠️ Barcode-Paket (pyzbar) fehlt.")
+            if not PYZBAR_AVAILABLE: st.error("⚠️ Barcode-Paket fehlt.")
             else:
-                # Der "Native Hack": file_uploader öffnet am Handy die echte Kamera-App
-                img_file_buffer = st.file_uploader("Barcode fotografieren (Rückkamera & Autofokus)", type=["jpg", "jpeg", "png"])
-                
-                if img_file_buffer is not None:
-                    with st.spinner("Scanne Bild..."):
+                img_file_buffer = st.file_uploader("Barcode fotografieren (Rückkamera)", type=["jpg", "jpeg", "png"], key="cam_upload")
+                if img_file_buffer:
+                    with st.spinner("Lese Bild..."):
                         try:
-                            # Öffne das hochgeladene Bild
-                            img = Image.open(img_file_buffer)
-                            decoded_objects = decode(img)
-                            
+                            decoded_objects = decode(Image.open(img_file_buffer))
                             if decoded_objects:
                                 barcode_value = decoded_objects[0].data.decode("utf-8")
                                 st.success(f"✅ Barcode erkannt: {barcode_value}")
-                            else: 
-                                st.warning("⚠️ Kein Barcode gefunden. Tipp: Halte die Kamera ruhiger oder sorge für mehr Licht.")
+                            else:
+                                st.warning("⚠️ Kein Barcode gefunden. Bitte auf gute Beleuchtung achten.")
                         except Exception as e:
-                            st.error(f"Fehler beim Verarbeiten des Bildes: {e}")
+                            st.error(f"Fehler: {e}")
         
-        # Logik für den API-Abruf (bleibt erhalten, aber sauber integriert)
         if barcode_value and barcode_value != st.session_state.last_barcode:
             with st.spinner("Suche Makros bei Open Food Facts..."):
                 st.session_state.api_data = fetch_product_from_api(barcode_value)
@@ -313,16 +288,14 @@ elif menu == "📥 Lebensmittel aufnehmen":
 
         data = st.session_state.api_data if st.session_state.api_data else {}
         n_name_temp = data.get('Name', '')
-        # --- ENDE DES ERSETZTEN BLOCKS ---
         
-        # --- NEU: USDA SUCH-BLOCK ---
         if data or barcode_value:
             st.divider()
             st.write("### 🔬 3. Mikronährstoffe aus USDA laden (Optional)")
             c_u1, c_u2 = st.columns([3, 1])
-            usda_query = c_u1.text_input("Suchbegriff (Deutsch, z.B. Kichererbsen, Lachs)", value=n_name_temp)
+            usda_query = c_u1.text_input("Suchbegriff (Deutsch, z.B. Kichererbsen, Lachs)", value=n_name_temp, key="usda_query_input")
             
-            if c_u2.button("🔍 In USDA suchen"):
+            if c_u2.button("🔍 In USDA suchen", key="usda_search_btn"):
                 if "usda_api_key" not in st.secrets:
                     st.error("Bitte USDA API Key in den Streamlit Secrets hinterlegen!")
                 elif usda_query:
@@ -334,14 +307,13 @@ elif menu == "📥 Lebensmittel aufnehmen":
             
             if st.session_state.usda_results:
                 options = {f"{r['description']} (FDC ID: {r['fdcId']})": r['fdcId'] for r in st.session_state.usda_results}
-                sel_usda = st.selectbox("Ergebnisse:", list(options.keys()))
-                if st.button("⬇️ Mikronährstoffe für dieses Produkt in die Matrix laden"):
+                sel_usda = st.selectbox("Ergebnisse:", list(options.keys()), key="usda_dropdown")
+                if st.button("⬇️ Mikronährstoffe für dieses Produkt in die Matrix laden", key="usda_load_btn"):
                     with st.spinner("Lade USDA Daten..."):
                         fdc_id = options[sel_usda]
                         st.session_state.usda_micros = get_usda_micros(fdc_id, st.secrets["usda_api_key"])
                         st.success("✅ Erfolgreich geladen! Die Werte sind jetzt im Formular vorausgefüllt.")
 
-        # --- DAS EIGENTLICHE FORMULAR ---
         if data or barcode_value: 
             with st.form("inv_from_barcode"):
                 st.write("**1. Produkt Identifikation:**")
@@ -357,10 +329,9 @@ elif menu == "📥 Lebensmittel aufnehmen":
                     with tabs_scan[i]:
                         l = st.columns(4)
                         for j, c_name in enumerate(cols):
-                            # HIER KOMMT DIE MAGIE: Prio 1: USDA, Prio 2: OpenFoodFacts, Prio 3: 0.0
                             default_val = float(st.session_state.usda_micros.get(c_name, data.get(c_name, 0.0)))
                             scan_nutrients[c_name] = l[j % 4].number_input(
-                                c_name.replace("_100", ""), value=default_val, min_value=0.0, key=f"scan_{c_name}"
+                                c_name.replace("_100", ""), value=default_val, min_value=0.0, key=f"scan_nutri_{c_name}"
                             )
 
                 st.write("**3. Bestandsdaten eingeben:**")
@@ -426,7 +397,7 @@ elif menu == "📦 Vorratskammer":
                 st.write("**Schnelle Entnahme:**")
                 c_ent1, c_ent2 = st.columns([2, 1])
                 entnahme = c_ent1.number_input("Menge abziehen", min_value=0.0, step=0.01, value=0.0, key=f"ent_{idx}")
-                if c_ent2.button("➖ Abziehen"):
+                if c_ent2.button("➖ Abziehen", key=f"btn_ent_{idx}"):
                     if entnahme > 0:
                         neu_bestand = max(0.0, float(r['Menge']) - entnahme)
                         inv.at[idx, 'Menge'] = neu_bestand
@@ -570,4 +541,3 @@ elif menu == "📚 Bibliothek (Stammdaten)":
                     st.success(f"{n_name} angelegt!")
                     st.rerun()
                 else: st.error("Bitte einen Namen vergeben!")
-

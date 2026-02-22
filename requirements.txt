@@ -5,3 +5,4 @@ pyzbar
 Pillow
 recipe-scrapers
 gspread
+deep-translator

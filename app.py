@@ -5,7 +5,7 @@ import requests
 import json
 from datetime import datetime, timedelta
 
-# --- KAMERA SCANNER IMPORTS ---
+# --- KAMERA SCANNER SETUP ---
 try:
     from pyzbar.pyzbar import decode
     from PIL import Image
@@ -107,7 +107,7 @@ def fetch_product_from_api(barcode):
                     "Natrium": n.get("sodium_100g", 0) * 1000 
                 }
     except Exception as e:
-        st.error(f"API Fehler: {e}")
+        pass
     return None
 
 def add_to_inventory(inv_df, new_entry):
@@ -286,7 +286,8 @@ if menu == "🍳 Meal Creator & Rezepte":
                             "Zutaten_JSON": json.dumps(zutaten_mini)
                         }
                         new_recipe.update(total_nutrients) 
-                        save_data(pd.concat([recipes, pd.DataFrame([new_recipe])], ignore_index=True), RECIPE_FILE)
+                        recipes = pd.concat([recipes, pd.DataFrame([new_recipe])], ignore_index=True)
+                        save_data(recipes, RECIPE_FILE)
                         
                         if save_to_lib:
                             lib_entry = {c: 0 for c in ALL_NUTRIENTS}
@@ -301,7 +302,8 @@ if menu == "🍳 Meal Creator & Rezepte":
                             })
                             for n in ALL_NUTRIENTS: 
                                 lib_entry[n] = total_nutrients[n] * f_100
-                            save_data(pd.concat([lib, pd.DataFrame([lib_entry])], ignore_index=True), LIB_FILE)
+                            lib = pd.concat([lib, pd.DataFrame([lib_entry])], ignore_index=True)
+                            save_data(lib, LIB_FILE)
                             
                         st.session_state.recipe_items = []
                         st.success("Rezept erfolgreich gespeichert!")
@@ -462,7 +464,8 @@ elif menu == "📥 Lebensmittel aufnehmen":
                             if key in ref_data: 
                                 del ref_data[key]
                         
-                        save_data(add_to_inventory(inv, ref_data), DB_FILE)
+                        inv = add_to_inventory(inv, ref_data)
+                        save_data(inv, DB_FILE)
                         st.success("Erfolgreich eingelagert!")
                         st.rerun()
 
@@ -539,7 +542,8 @@ elif menu == "📥 Lebensmittel aufnehmen":
                             "Einheit_Std": i_e
                         })
                         if not ((lib["Name"] == n_name) & (lib["Marke"] == n_marke)).any(): 
-                            save_data(pd.concat([lib, pd.DataFrame([lib_e])], ignore_index=True), LIB_FILE)
+                            lib = pd.concat([lib, pd.DataFrame([lib_e])], ignore_index=True)
+                            save_data(lib, LIB_FILE)
                         
                         inv_e = entry.copy()
                         inv_e.update({
@@ -547,7 +551,9 @@ elif menu == "📥 Lebensmittel aufnehmen":
                             "Einheit": i_e, 
                             "MHD": i_d
                         })
-                        save_data(add_to_inventory(inv, inv_e), DB_FILE)
+                        inv = add_to_inventory(inv, inv_e)
+                        save_data(inv, DB_FILE)
+                        
                         st.success("Erfolgreich gespeichert!")
                         st.rerun()
             else:
@@ -671,7 +677,7 @@ elif menu == "📚 Bibliothek (Stammdaten)":
                 n_kat = c3.selectbox("Kategorie", kategorien, index=kat_index)
                 
                 c4, c5, c6 = st.columns(3)
-                n_ms = c4.number_input("Referenzmenge", float(r.get("Menge_Std", 100)))
+                n_ms = c4.number_input("Referenzmenge", value=float(r.get("Menge_Std", 100)))
                 es_index = UNITS.index(r["Einheit_Std"]) if r["Einheit_Std"] in UNITS else 0
                 n_es = c5.selectbox("Einheit", UNITS, index=es_index)
                 np = c6.number_input("Preis für diese Menge", float(r["Preis"]))
@@ -753,10 +759,10 @@ elif menu == "📚 Bibliothek (Stammdaten)":
                         new_entry[k] = v
                         
                     if not ((lib["Name"] == n_name) & (lib["Marke"] == n_marke)).any(): 
-                        save_data(pd.concat([lib, pd.DataFrame([new_entry])], ignore_index=True), LIB_FILE)
+                        lib = pd.concat([lib, pd.DataFrame([new_entry])], ignore_index=True)
+                        save_data(lib, LIB_FILE)
                         st.success("Neues Produkt angelegt!")
                         st.rerun()
                     else: 
                         st.error("Dieses Produkt existiert bereits in der Bibliothek.")
-
-# === ENDE DES CODES ===
+                        

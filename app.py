@@ -90,7 +90,7 @@ if menu == "🍳 Meal Creator & Rezepte":
                     menge_input = c_m.number_input("Manuelle Menge", value=0.0, min_value=0.0, step=0.1)
                     einheit_input = c_e.selectbox("Einheit", UNITS, index=UNITS.index(item_data["Einheit_Std"]) if item_data["Einheit_Std"] in UNITS else 0)
                     
-                    # Hier ist der Platzhalter für die spätere Bluetooth-Waage!
+                    # Hier ist der Platzhalter für die spätere Bluetooth-Waage
                     waage_input = c_w.number_input("⚖️ Wert von Waage", value=0.0, min_value=0.0)
                     
                     final_menge = waage_input if waage_input > 0 else menge_input
@@ -272,7 +272,7 @@ if menu == "🍳 Meal Creator & Rezepte":
             c_eat, c_save = st.columns(2)
             weight_per_portion = total_weight_g / total_portions if total_portions > 0 else total_weight_g
             
-            # Sicherheitsnetz: Verhindert Absturz, falls Gewicht 0 ist (z.B. nur Eier/Stück verwendet)
+            # Sicherheitsnetz: Verhindert Absturz, falls Gewicht 0 ist
             max_input_val = float(total_weight_g) if total_weight_g > 0 else 100.0 
             
             eaten_g = c_eat.number_input(
@@ -391,16 +391,23 @@ elif menu == "📥 Lebensmittel aufnehmen":
             else:
                 img_file_buffer = st.file_uploader("Barcode fotografieren (Rückkamera)", type=["jpg", "jpeg", "png"], key="cam_upload")
                 if img_file_buffer:
-                    with st.spinner("Lese Bild..."):
+                    with st.spinner("Optimiere und lese Bild (Das dauert kurz)..."):
                         try:
-                            decoded_objects = decode(Image.open(img_file_buffer))
+                            img = Image.open(img_file_buffer)
+                            
+                            # Bild-Kompressor: Verhindert Abstürze bei großen Smartphone-Bildern
+                            img.thumbnail((800, 800)) 
+                            img = img.convert('L') 
+                            
+                            decoded_objects = decode(img)
+                            
                             if decoded_objects:
                                 barcode_value = decoded_objects[0].data.decode("utf-8")
                                 st.success(f"✅ Barcode erkannt: {barcode_value}")
                             else: 
-                                st.warning("⚠️ Kein Barcode gefunden.")
+                                st.warning("⚠️ Kein Barcode gefunden. Bitte näher rangehen oder den Strichcode besser ausleuchten.")
                         except Exception as e: 
-                            st.error(f"Fehler: {e}")
+                            st.error(f"Fehler bei der Bildverarbeitung: {e}")
         
         # Abruf der Makros über Open Food Facts
         if barcode_value and barcode_value != st.session_state.last_barcode:
@@ -658,3 +665,54 @@ elif menu == "📚 Bibliothek (Stammdaten)":
                     lib = lib.drop(idx).reset_index(drop=True)
                     save_data(lib, LIB_FILE)
                     st.rerun()
+                    
+    st.divider()
+    
+    # DIESER BLOCK WAR ABGESCHNITTEN!
+    with st.expander("➕ Neues Basis-Produkt manuell anlegen"):
+        with st.form("new_lib_form"):
+            c1, c2, c3 = st.columns(3)
+            n_name = c1.text_input("Produkt*")
+            n_marke = c2.text_input("Marke")
+            n_kat = c3.selectbox("Kategorie", KATEGORIEN)
+            
+            c4, c5, c6 = st.columns(3)
+            n_menge = c4.number_input("Referenzmenge", value=100.0, min_value=0.0)
+            n_einh = c5.selectbox("Einheit", UNITS)
+            n_preis = c6.number_input("Preis (€)", value=0.0, min_value=0.0)
+            
+            new_nutrients = {}
+            tabs_new = st.tabs(list(NUTRIENTS.keys()))
+            
+            for i, (group, cols) in enumerate(NUTRIENTS.items()):
+                with tabs_new[i]:
+                    l = st.columns(4)
+                    for j, c_name in enumerate(cols): 
+                        new_nutrients[c_name] = l[j % 4].number_input(
+                            c_name.replace("_100", ""), 
+                            value=0.0, 
+                            min_value=0.0, 
+                            key=f"new_lib_{c_name}"
+                        )
+            
+            if st.form_submit_button("Neues Produkt anlegen"):
+                if n_name:
+                    new_entry = {c: 0.0 for c in ALL_NUTRIENTS}
+                    for k, v in new_nutrients.items(): 
+                        new_entry[k] = v
+                    
+                    new_entry.update({
+                        "Name": n_name, 
+                        "Marke": n_marke, 
+                        "Kategorie": n_kat, 
+                        "Menge_Std": n_menge, 
+                        "Einheit_Std": n_einh, 
+                        "Preis": n_preis
+                    })
+                    
+                    lib = pd.concat([lib, pd.DataFrame([new_entry])], ignore_index=True)
+                    save_data(lib, LIB_FILE)
+                    st.success(f"{n_name} angelegt!")
+                    st.rerun()
+                else: 
+                    st.error("Bitte einen Namen vergeben!")

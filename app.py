@@ -11,7 +11,7 @@ from backend import (
     DB_FILE, LIB_FILE, RECIPE_FILE, HISTORY_FILE, NUTRIENTS, ALL_NUTRIENTS, UNITS,
     KATEGORIEN, MHD_DEFAULTS,
     init_dbs, load_data, save_data, log_history, to_grams, from_grams,
-    predict_category, fetch_comprehensive_data,
+    predict_category, fetch_comprehensive_data, search_usda_list, get_usda_data_by_id,
     add_to_inventory, update_inventory_item, delete_inventory_item,
     calculate_recipe_totals, deduct_cooked_recipe_from_inventory, get_stats_data
 )
@@ -28,7 +28,6 @@ except ImportError:
 st.set_page_config(page_title="NutriStock Pro", layout="wide", page_icon="🥗")
 init_dbs()
 
-# Die Farben kommen aus deiner .streamlit/config.toml! Hier definieren wir nur Formen.
 st.markdown("""
     <style>
     .card { background-color: rgba(255, 255, 255, 0.03); padding: 20px; border-radius: 12px; border-left: 5px solid #2e7d32; margin-bottom: 20px; box-shadow: 0 4px 10px rgba(0,0,0,0.2); }
@@ -53,7 +52,7 @@ if "temp_nutrients" not in st.session_state: st.session_state.temp_nutrients = {
 def clear_aufnahme_session():
     st.session_state.step = 1
     st.session_state.temp_nutrients = {n: None for n in ALL_NUTRIENTS}
-    for key in ["t_name", "t_marke", "t_menge", "t_preis", "t_einheit", "t_mhd", "t_kat", "last_barcode"]:
+    for key in ["t_name", "t_marke", "t_menge", "t_preis", "t_einheit", "t_mhd", "t_kat", "last_barcode", "usda_hits"]:
         if key in st.session_state: del st.session_state[key]
 
 # ==========================================
@@ -66,7 +65,8 @@ st.sidebar.divider()
 st.sidebar.subheader("⚡ Quick-Verbrauch")
 sidebar_inv = load_data(DB_FILE)
 if not sidebar_inv.empty:
-    for _, item in sidebar_inv.head(4).iterrows():
+    # NEU: Zeigt jetzt intelligent die 4 zuletzt hinzugefügten Produkte (Reverse-Order)
+    for _, item in sidebar_inv.iloc[::-1].head(4).iterrows():
         if st.sidebar.button(f"➖ {item['Name']} verbrauchen", key=f"q_{item['Name']}"):
             unit = 1 if item['Einheit'] == "Stk." else 100
             new_inv = deduct_cooked_recipe_from_inventory([{"Name": item['Name'], "RezeptMenge": unit, "Einheit_Std": item['Einheit']}], sidebar_inv)
@@ -74,7 +74,7 @@ if not sidebar_inv.empty:
             st.toast(f"{unit}{item['Einheit']} {item['Name']} abgezogen!")
             st.rerun()
 else:
-    st.sidebar.info("Vorrat leer.")
+    st.sidebar.info("Dein Vorrat ist leer.")
 
 # ==========================================
 # MODUL 1: AUFNAHME WIZARD & FAST-TRACK
@@ -129,12 +129,12 @@ if menu == "📥 Einkauf eintragen":
                     if decoded: barcode = decoded[0].data.decode("utf-8")
 
             if barcode and barcode != st.session_state.get("last_barcode"):
-                with st.spinner("Lade API Daten..."):
+                with st.spinner("Lade Open Food Facts Daten..."):
                     api_data = fetch_comprehensive_data(barcode, st.secrets["usda_api_key"])
                     st.session_state.t_name, st.session_state.t_marke = api_data["Name"], api_data["Marke"]
                     for n, v in api_data["nutrients"].items(): st.session_state.temp_nutrients[n] = float(v) if v else None
                     st.session_state.last_barcode = barcode
-                    st.toast("Nährwerte geladen!", icon="✅")
+                    st.toast("Verpackungs-Daten geladen!", icon="✅")
 
             with st.form("form_basis"):
                 c_n, c_m = st.columns([2, 1])
@@ -142,14 +142,19 @@ if menu == "📥 Einkauf eintragen":
                 f_marke = c_m.text_input("Marke", value=st.session_state.get("t_marke", ""))
                 
                 c1, c2, c3 = st.columns(3)
-                f_menge = c1.number_input("Menge*", value=None, placeholder="Zahl...", step=0.1)
-                f_einheit = c2.selectbox("Einheit*", UNITS)
-                f_preis = c3.number_input("Preis (€)*", value=None, placeholder="0.00", step=0.01)
+                f_menge = c1.number_input("Menge*", value=st.session_state.get("t_menge"), placeholder="Zahl...", step=0.1)
+                
+                old_unit_idx = UNITS.index(st.session_state.t_einheit) if "t_einheit" in st.session_state and st.session_state.t_einheit in UNITS else 0
+                f_einheit = c2.selectbox("Einheit*", UNITS, index=old_unit_idx)
+                f_preis = c3.number_input("Preis (€)*", value=st.session_state.get("t_preis"), placeholder="0.00", step=0.01)
                 
                 c4, c5 = st.columns(2)
                 cat_sugg = predict_category(f_name)
-                f_kat = c4.selectbox("Kategorie*", KATEGORIEN, index=KATEGORIEN.index(cat_sugg) if cat_sugg in KATEGORIEN else 0)
-                f_mhd = c5.date_input("MHD*", value=datetime.now() + timedelta(days=MHD_DEFAULTS.get(cat_sugg, 14)))
+                old_kat = st.session_state.get("t_kat", cat_sugg)
+                old_kat_idx = KATEGORIEN.index(old_kat) if old_kat in KATEGORIEN else 0
+                
+                f_kat = c4.selectbox("Kategorie*", KATEGORIEN, index=old_kat_idx)
+                f_mhd = c5.date_input("MHD*", value=st.session_state.get("t_mhd", datetime.now() + timedelta(days=MHD_DEFAULTS.get(cat_sugg, 14))))
                 
                 if st.form_submit_button("Weiter zu Makros ➡️"):
                     if f_name and f_menge is not None and f_preis is not None:
@@ -160,7 +165,7 @@ if menu == "📥 Einkauf eintragen":
                     else: st.error("Bitte alle mit * markierten Felder ausfüllen.")
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # SCHRITT 2 (EU-Layout)
+        # SCHRITT 2
         elif st.session_state.step == 2:
             st.subheader(f"🍎 Nährwertdeklaration für {st.session_state.t_name}")
             with st.form("form_makro"):
@@ -181,13 +186,42 @@ if menu == "📥 Einkauf eintragen":
                 st.markdown("<br>", unsafe_allow_html=True)
                 
                 cb, cs, cn = st.columns([1, 2, 2])
-                if cb.form_submit_button("⬅️ Zurück"): st.session_state.step = 1; st.rerun()
-                if cs.form_submit_button("💾 Direkt Speichern"): st.session_state.do_save = True
-                if cn.form_submit_button("🔬 Mikros bearbeiten ➡️"): st.session_state.step = 3; st.rerun()
+                if cb.form_submit_button("⬅️ Zurück zu Schritt 1"): 
+                    st.session_state.step = 1; st.rerun()
+                if cs.form_submit_button("💾 Direkt Speichern"): 
+                    st.session_state.do_save = True
+                if cn.form_submit_button("🔬 Mikros hinzufügen ➡️"): 
+                    st.session_state.step = 3; st.rerun()
 
         # SCHRITT 3
         elif st.session_state.step == 3:
             st.subheader("🔬 Mikronährstoffe (pro 100g)")
+            
+            # --- USDA SUCHE (Sicher außerhalb des Formulars) ---
+            with st.expander("🔍 Laborwerte für generische Lebensmittel suchen (USDA)", expanded=False):
+                st.info("Suche hier auf Deutsch. Die App übersetzt und sucht im US-Labor.")
+                c_sq, c_sb = st.columns([3, 1])
+                usda_query = c_sq.text_input("Suchbegriff", placeholder="z.B. Kokosmilch")
+                
+                if c_sb.button("Labor durchsuchen"):
+                    if usda_query:
+                        with st.spinner("Übersetze und suche in USDA..."):
+                            st.session_state.usda_hits = search_usda_list(usda_query, st.secrets["usda_api_key"])
+                            if not st.session_state.usda_hits: st.warning("Keine Treffer gefunden.")
+                
+                if st.session_state.get("usda_hits"):
+                    opts = {f"{h['desc']} (ID: {h['id']})": h['id'] for h in st.session_state.usda_hits}
+                    sel_hit = st.selectbox("Wähle den passendsten Wert:", list(opts.keys()))
+                    
+                    if st.button("⬇️ Diese Mikros übernehmen"):
+                        with st.spinner("Lade Detail-Nährwerte..."):
+                            new_micros = get_usda_data_by_id(opts[sel_hit], st.secrets["usda_api_key"])
+                            for k, v in new_micros.items():
+                                if v > 0: st.session_state.temp_nutrients[k] = v
+                            st.success("Werte geladen! Überprüfe das Formular unten.")
+                            st.rerun()
+
+            # --- DAS MIKRO FORMULAR ---
             with st.form("form_mikro"):
                 for g_name, items in NUTRIENTS.items():
                     if g_name == "Makronährstoffe": continue
@@ -195,7 +229,13 @@ if menu == "📥 Einkauf eintragen":
                     mcols = st.columns(4)
                     for i, item in enumerate(items):
                         st.session_state.temp_nutrients[item] = mcols[i%4].number_input(item, value=st.session_state.temp_nutrients.get(item), placeholder="0.0")
-                if st.form_submit_button("✅ Final Speichern"): st.session_state.do_save = True; st.rerun()
+                
+                st.markdown("<br>", unsafe_allow_html=True)
+                cb, cs = st.columns([1, 4])
+                if cb.form_submit_button("⬅️ Zurück zu Makros"): 
+                    st.session_state.step = 2; st.rerun()
+                if cs.form_submit_button("✅ Final Speichern & Einlagern"): 
+                    st.session_state.do_save = True; st.rerun()
 
         # SPEICHER-LOGIK WIZARD
         if st.session_state.get("do_save"):
@@ -220,18 +260,24 @@ elif menu == "🍳 Rezept Labor":
     if lib.empty:
         st.info("📚 Bitte lege zuerst Lebensmittel über den 'Aufnahme Wizard' an, bevor du Rezepte erstellst.")
     else:
-        # PHASE 1: BUILD
         if st.session_state.recipe_phase == "build":
             st.markdown("<div class='card'>", unsafe_allow_html=True)
             c_sel, c_qty, c_add = st.columns([3, 1, 1])
             sel_item = c_sel.selectbox("Zutat aus Bibliothek", ["--"] + lib["Name"].tolist())
             qty_item = c_qty.number_input("Menge", value=None, placeholder="z.B. 150")
+            
             if c_add.button("➕ Hinzufügen"):
                 if sel_item != "--" and qty_item is not None:
-                    details = lib[lib["Name"] == sel_item].iloc[0].to_dict()
-                    details["RezeptMenge"] = float(qty_item)
-                    st.session_state.recipe_items.append(details)
-                    st.toast(f"{sel_item} hinzugefügt!")
+                    # NEU: Verhindert doppelte Einträge und addiert Mengen clever!
+                    existing_idx = next((i for i, item in enumerate(st.session_state.recipe_items) if item["Name"] == sel_item), None)
+                    if existing_idx is not None:
+                        st.session_state.recipe_items[existing_idx]["RezeptMenge"] += float(qty_item)
+                        st.toast(f"Menge von {sel_item} aktualisiert!")
+                    else:
+                        details = lib[lib["Name"] == sel_item].iloc[0].to_dict()
+                        details["RezeptMenge"] = float(qty_item)
+                        st.session_state.recipe_items.append(details)
+                        st.toast(f"{sel_item} neu hinzugefügt!")
             st.markdown("</div>", unsafe_allow_html=True)
 
             if st.session_state.recipe_items:
@@ -255,7 +301,6 @@ elif menu == "🍳 Rezept Labor":
                     st.session_state.recipe_phase = "summary"
                     st.rerun()
 
-        # PHASE 2: SUMMARY & KOCHEN
         elif st.session_state.recipe_phase == "summary":
             st.subheader("📊 Zusammenfassung & Speichern")
             scaler = st.slider("Personen/Portionen anpassen", 0.5, 5.0, 1.0, 0.5)
@@ -275,7 +320,7 @@ elif menu == "🍳 Rezept Labor":
                 eat_now = st.number_input("Jetzt essen (in g)", value=None, placeholder="0.0")
                 c_back, c_save = st.columns(2)
                 
-                if c_back.form_submit_button("⬅️ Zurück"): 
+                if c_back.form_submit_button("⬅️ Zurück zum Bearbeiten"): 
                     st.session_state.recipe_phase = "build"
                     st.rerun()
                 
@@ -289,7 +334,6 @@ elif menu == "🍳 Rezept Labor":
                         save_data(deduct_cooked_recipe_from_inventory(st.session_state.recipe_items, inv), DB_FILE)
                         saved_g = w - eat_g
                         
-                        # Absicherung gegen Division by Zero bei 0g Gewicht
                         if saved_g > 0 and w > 0:
                             meal = {"Name": f"Vorbereitet: {r_name}", "Marke": "Selbstgekocht", "Menge": saved_g, "Einheit": "g", "Preis": (cost/w)*saved_g, "MHD": get_mhd_default("Selbstgekocht").strftime("%Y-%m-%d")}
                             meal.update(nutris)

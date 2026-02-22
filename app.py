@@ -276,16 +276,36 @@ elif menu == "📥 Lebensmittel aufnehmen":
         
         if scan_method == "⌨️ Tastatur-Eingabe":
             barcode_value = st.text_input("Barcode tippen:")
-        elif scan_method == "📷 Kamera-Scanner":
-            if not PYZBAR_AVAILABLE: st.error("⚠️ Barcode-Paket fehlt.")
-            else:
-                img_file_buffer = st.camera_input("Halte den Barcode in die Kamera")
-                if img_file_buffer:
-                    decoded_objects = decode(Image.open(img_file_buffer))
-                    if decoded_objects:
-                        barcode_value = decoded_objects[0].data.decode("utf-8")
-                        st.success(f"✅ Barcode erkannt: {barcode_value}")
+        # --- DIESER BLOCK ERSETZT DEINEN GEPOSTETEN CODE ---
+        scan_method = st.radio("Methode:", ["⌨️ Tastatur-Eingabe", "📷 Kamera-Scanner"])
+        barcode_value = ""
         
+        if scan_method == "⌨️ Tastatur-Eingabe":
+            barcode_value = st.text_input("Barcode tippen:")
+            
+        elif scan_method == "📷 Kamera-Scanner":
+            if not PYZBAR_AVAILABLE: 
+                st.error("⚠️ Barcode-Paket (pyzbar) fehlt.")
+            else:
+                # Der "Native Hack": file_uploader öffnet am Handy die echte Kamera-App
+                img_file_buffer = st.file_uploader("Barcode fotografieren (Rückkamera & Autofokus)", type=["jpg", "jpeg", "png"])
+                
+                if img_file_buffer is not None:
+                    with st.spinner("Scanne Bild..."):
+                        try:
+                            # Öffne das hochgeladene Bild
+                            img = Image.open(img_file_buffer)
+                            decoded_objects = decode(img)
+                            
+                            if decoded_objects:
+                                barcode_value = decoded_objects[0].data.decode("utf-8")
+                                st.success(f"✅ Barcode erkannt: {barcode_value}")
+                            else: 
+                                st.warning("⚠️ Kein Barcode gefunden. Tipp: Halte die Kamera ruhiger oder sorge für mehr Licht.")
+                        except Exception as e:
+                            st.error(f"Fehler beim Verarbeiten des Bildes: {e}")
+        
+        # Logik für den API-Abruf (bleibt erhalten, aber sauber integriert)
         if barcode_value and barcode_value != st.session_state.last_barcode:
             with st.spinner("Suche Makros bei Open Food Facts..."):
                 st.session_state.api_data = fetch_product_from_api(barcode_value)
@@ -293,6 +313,7 @@ elif menu == "📥 Lebensmittel aufnehmen":
 
         data = st.session_state.api_data if st.session_state.api_data else {}
         n_name_temp = data.get('Name', '')
+        # --- ENDE DES ERSETZTEN BLOCKS ---
         
         # --- NEU: USDA SUCH-BLOCK ---
         if data or barcode_value:
@@ -549,3 +570,4 @@ elif menu == "📚 Bibliothek (Stammdaten)":
                     st.success(f"{n_name} angelegt!")
                     st.rerun()
                 else: st.error("Bitte einen Namen vergeben!")
+

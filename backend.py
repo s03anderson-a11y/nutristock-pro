@@ -1,12 +1,16 @@
 import pandas as pd
-import os
 import requests
+import json
+import gspread
+import streamlit as st
+from google.oauth2.service_account import Credentials
 from datetime import datetime
 
 # --- KONSTANTEN & DATENSTRUKTUR ---
-DB_FILE = "vorrat.csv"
-LIB_FILE = "bibliothek.csv"
-RECIPE_FILE = "rezepte.csv"
+DB_FILE = "Vorrat"
+LIB_FILE = "Bibliothek"
+RECIPE_FILE = "Rezepte"
+HISTORY_FILE = "Historie"
 
 NUTRIENTS = {
     "Makronährstoffe": ["kcal_100", "Prot_100", "Fett_100", "Carb_100", "Fiber_100"],
@@ -20,50 +24,82 @@ NUTRIENTS = {
 ALL_NUTRIENTS = [item for sub in NUTRIENTS.values() for item in sub]
 UNITS = ["g", "kg", "ml", "L", "Stk."]
 
+# --- GOOGLE SHEETS VERBINDUNG ---
+@st.cache_resource
+def get_gspread_client():
+    creds_json = json.loads(st.secrets["google_credentials"])
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
+    return gspread.authorize(creds)
+
+def get_sheet():
+    client = get_gspread_client()
+    return client.open("NutriStock_DB")
+
 # --- DATENBANK FUNKTIONEN ---
 def init_dbs():
-    if not os.path.exists(LIB_FILE):
-        cols = ["Name", "Marke", "Kategorie", "Menge_Std", "Einheit_Std", "Preis"] + ALL_NUTRIENTS
-        pd.DataFrame(columns=cols).to_csv(LIB_FILE, index=False)
-    if not os.path.exists(DB_FILE):
-        cols = ["Name", "Marke", "Menge", "Einheit", "Preis", "MHD"] + ALL_NUTRIENTS
-        pd.DataFrame(columns=cols).to_csv(DB_FILE, index=False)
-    if not os.path.exists(RECIPE_FILE):
-        cols = ["ID", "Name", "Kategorie", "Portionen", "Gewicht_Gesamt", "Preis_Gesamt", "Zutaten_JSON", "Zubereitung"] + ALL_NUTRIENTS
-        pd.DataFrame(columns=cols).to_csv(RECIPE_FILE, index=False)
-
-def load_data(file_path): 
-    df = pd.read_csv(file_path)
-    changed = False
-    
-    # Rückwärtskompatibilität & fehlende Spalten ergänzen
-    if "Marke" not in df.columns and file_path != RECIPE_FILE: 
-        df.insert(1, "Marke", "")
-        changed = True
-    if "Preis" not in df.columns and file_path != RECIPE_FILE: 
-        df.insert(4, "Preis", 0.0)
-        changed = True
-    if "Menge_Std" not in df.columns and file_path == LIB_FILE: 
-        df.insert(3, "Menge_Std", 100.0)
-        changed = True
-    if "Gewicht_Gesamt" not in df.columns and file_path == RECIPE_FILE: 
-        df.insert(4, "Gewicht_Gesamt", 0.0)
-        changed = True
-    if "Preis_Gesamt" not in df.columns and file_path == RECIPE_FILE: 
-        df.insert(5, "Preis_Gesamt", 0.0)
-        changed = True
-    if "Zubereitung" not in df.columns and file_path == RECIPE_FILE:
-        df["Zubereitung"] = ""
-        changed = True
+    # FIX: Google API Limits schützen! Führt Prüfung nur 1x pro Sitzung durch.
+    if "dbs_initialized" in st.session_state:
+        return
         
-    if changed: 
-        df.to_csv(file_path, index=False)
+    sheet = get_sheet()
+    
+    def init_tab(name, cols):
+        try:
+            worksheet = sheet.worksheet(name)
+            # Prüfen, ob die Tabelle wirklich ganz leer ist
+            if not worksheet.get_all_values(): 
+                worksheet.append_row(cols)
+        except gspread.WorksheetNotFound:
+            worksheet = sheet.add_worksheet(title=name, rows="100", cols="50")
+            worksheet.append_row(cols)
+
+    init_tab(LIB_FILE, ["Name", "Marke", "Kategorie", "Menge_Std", "Einheit_Std", "Preis"] + ALL_NUTRIENTS)
+    init_tab(DB_FILE, ["Name", "Marke", "Menge", "Einheit", "Preis", "MHD"] + ALL_NUTRIENTS)
+    init_tab(RECIPE_FILE, ["ID", "Name", "Kategorie", "Portionen", "Gewicht_Gesamt", "Preis_Gesamt", "Zutaten_JSON", "Zubereitung"] + ALL_NUTRIENTS)
+    init_tab(HISTORY_FILE, ["Datum", "Aktion", "Name", "Marke", "Menge", "Einheit", "Preis"])
+    
+    st.session_state.dbs_initialized = True
+
+def load_data(sheet_name):
+    sheet = get_sheet().worksheet(sheet_name)
+    records = sheet.get_all_records()
+    headers = sheet.row_values(1)
+    
+    if not records:
+        return pd.DataFrame(columns=headers)
+        
+    df = pd.DataFrame(records)
+    for col in headers:
+        if col not in df.columns:
+            df[col] = ""
     return df
 
-def save_data(df, file_path): 
-    if "Status" in df.columns: 
+def save_data(df, sheet_name):
+    if "Status" in df.columns:
         df = df.drop(columns=["Status"])
-    df.to_csv(file_path, index=False)
+    
+    # FIX: NaN-Werte für Google Sheets säubern
+    df = df.fillna("")
+    
+    sheet = get_sheet().worksheet(sheet_name)
+    sheet.clear()
+    
+    data = [df.columns.values.tolist()] + df.values.tolist()
+    # FIX: Veraltete gspread-Syntax durch aktuelle ersetzt
+    sheet.update(values=data, range_name="A1")
+
+def log_history(aktion, name, marke, menge, einheit, preis):
+    """Schreibt einen Log-Eintrag für den 10-Jahres-Tracker."""
+    try:
+        sheet = get_sheet().worksheet(HISTORY_FILE)
+        datum = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sheet.append_row([datum, aktion, name, marke, menge, einheit, preis])
+    except Exception as e:
+        print(f"Historie konnte nicht gespeichert werden: {e}")
 
 # --- UMRECHNUNGEN & LOGIK ---
 def to_grams(menge, einheit):
@@ -98,6 +134,15 @@ def fetch_product_from_api(barcode):
     return None
 
 def add_to_inventory(inv_df, new_entry):
+    log_history(
+        "Gekauft / Eingelagert", 
+        new_entry.get("Name", ""), 
+        new_entry.get("Marke", ""), 
+        new_entry.get("Menge", 0), 
+        new_entry.get("Einheit", ""), 
+        new_entry.get("Preis", 0)
+    )
+    
     mask = (inv_df["Name"] == new_entry["Name"]) & (inv_df["Marke"] == new_entry["Marke"])
     if mask.any():
         idx = inv_df[mask].index[0]
@@ -115,11 +160,11 @@ def add_to_inventory(inv_df, new_entry):
     return inv_df
 
 def check_pantry(recipe_items_list, inv_df):
-    """Gleicht Zutaten mit der Vorratskammer ab."""
     results = []
     for item in recipe_items_list:
         if item.get("Is_Joker", False):
             continue
+            
         req_g = to_grams(item["Menge"], item["Einheit"])
         match = inv_df[inv_df["Name"].str.contains(item["Name"], case=False, na=False)]
         

@@ -5,282 +5,245 @@ import gspread
 import streamlit as st
 import difflib
 from google.oauth2.service_account import Credentials
-from datetime import datetime
-
-# Wir laden deep-translator nur, wenn das Paket installiert ist (Fehlervermeidung)
-try:
-    from deep_translator import GoogleTranslator
-    TRANSLATOR_AVAILABLE = True
-except ImportError:
-    TRANSLATOR_AVAILABLE = False
+from datetime import datetime, timedelta
 
 # --- KONSTANTEN & DATENSTRUKTUR ---
-DB_FILE = "Vorrat"
-LIB_FILE = "Bibliothek"
-RECIPE_FILE = "Rezepte"
-HISTORY_FILE = "Historie"
+DB_FILE, LIB_FILE, RECIPE_FILE, HISTORY_FILE = "Vorrat", "Bibliothek", "Rezepte", "Historie"
 
 NUTRIENTS = {
     "Makronährstoffe": ["kcal_100", "Prot_100", "Fett_100", "Carb_100", "Fiber_100"],
-    "Vitamine (Fettlöslich)": ["Vit_A", "Vit_D", "Vit_E", "Vit_K"],
-    "Vitamine (Wasserlöslich)": ["Vit_C", "B1", "B2", "B3", "B5", "B6", "B7", "B9", "B12"],
-    "Mineralstoffe (Mengen)": ["Calcium", "Magnesium", "Kalium", "Natrium", "Chlorid", "Phosphor", "Schwefel"],
-    "Mineralstoffe (Spuren)": ["Eisen", "Zink", "Jod", "Selen", "Kupfer", "Mangan", "Fluorid", "Chrom", "Molybdän"],
-    "Sekundäre Pflanzenstoffe": ["Polyphenole", "Carotinoide", "Sulfide", "Glucosinolate"]
+    "Vitamine": ["Vit_A", "Vit_D", "Vit_E", "Vit_K", "Vit_C", "B1", "B2", "B3", "B5", "B6", "B7", "B9", "B12"],
+    "Mineralstoffe": ["Calcium", "Magnesium", "Kalium", "Natrium", "Chlorid", "Phosphor", "Eisen", "Zink", "Jod", "Selen", "Kupfer", "Mangan"]
 }
-
 ALL_NUTRIENTS = [item for sub in NUTRIENTS.values() for item in sub]
 UNITS = ["g", "kg", "ml", "L", "Stk."]
 
-# --- GOOGLE SHEETS VERBINDUNG ---
+# --- LOGIK-DATENBANKEN (Vorschlag: Gewichts-Intuition & Smart Buffer) ---
+STD_WEIGHTS = {
+    "zitrone": 60, "ei": 55, "apfel": 150, "banane": 120, "zwiebel": 80, 
+    "knoblauch": 5, "kartoffel": 100, "tomate": 80, "orange": 200
+}
+
+MHD_DEFAULTS = {
+    "Selbstgekocht": 4, "Fleisch": 3, "Fisch": 2, "Gemüse": 7, "Obst": 7, 
+    "Milchprodukte": 10, "Getreide": 180, "Konserve": 365, "Allgemein": 14
+}
+
+# --- GOOGLE SHEETS CONNECTION ---
 @st.cache_resource
 def get_gspread_client():
-    creds_json = json.loads(st.secrets["google_credentials"])
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-    creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
-    return gspread.authorize(creds)
+    try:
+        creds_dict = json.loads(st.secrets["google_credentials"])
+        creds = Credentials.from_service_account_info(
+            creds_dict, 
+            scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        )
+        return gspread.authorize(creds)
+    except Exception as e:
+        st.error(f"Kritischer Fehler bei der Google-Verbindung: {e}")
+        return None
 
 def get_sheet():
     client = get_gspread_client()
     return client.open("NutriStock_DB")
 
-# --- DATENBANK FUNKTIONEN ---
 def init_dbs():
-    if "dbs_initialized" in st.session_state:
-        return
-        
+    if "dbs_initialized" in st.session_state: return
     sheet = get_sheet()
-    
     def init_tab(name, cols):
         try:
-            worksheet = sheet.worksheet(name)
-            try:
-                headers = worksheet.row_values(1)
-                if not headers:
-                    worksheet.insert_row(cols, index=1)
-            except Exception:
-                worksheet.insert_row(cols, index=1)
-        except gspread.WorksheetNotFound:
-            worksheet = sheet.add_worksheet(title=name, rows="100", cols="50")
-            worksheet.insert_row(cols, index=1)
-
+            ws = sheet.worksheet(name)
+            if not ws.row_values(1): ws.insert_row(cols, index=1)
+        except:
+            sheet.add_worksheet(title=name, rows="1000", cols="50").insert_row(cols, index=1)
+    
     init_tab(LIB_FILE, ["Name", "Marke", "Kategorie", "Menge_Std", "Einheit_Std", "Preis"] + ALL_NUTRIENTS)
     init_tab(DB_FILE, ["Name", "Marke", "Menge", "Einheit", "Preis", "MHD"] + ALL_NUTRIENTS)
-    init_tab(RECIPE_FILE, ["ID", "Name", "Kategorie", "Portionen", "Gewicht_Gesamt", "Preis_Gesamt", "Zutaten_JSON", "Zubereitung"] + ALL_NUTRIENTS)
+    init_tab(RECIPE_FILE, ["ID", "Name", "Kategorie", "Preis_Gesamt", "Gewicht_Gesamt", "Zutaten_JSON"] + ALL_NUTRIENTS)
     init_tab(HISTORY_FILE, ["Datum", "Aktion", "Name", "Marke", "Menge", "Einheit", "Preis"])
-    
     st.session_state.dbs_initialized = True
 
+@st.cache_data(ttl=30)
 def load_data(sheet_name):
     try:
-        sheet = get_sheet().worksheet(sheet_name)
-        records = sheet.get_all_records()
-        headers = sheet.row_values(1)
-        
-        if not records:
-            return pd.DataFrame(columns=headers)
-            
-        df = pd.DataFrame(records)
-        
-        for col in headers:
-            if col not in df.columns:
-                df[col] = ""
-                
-        return df
-    except Exception as e:
-        print(f"Fehler beim Laden von {sheet_name}: {e}")
+        ws = get_sheet().worksheet(sheet_name)
+        records = ws.get_all_records()
+        return pd.DataFrame(records) if records else pd.DataFrame(columns=ws.row_values(1))
+    except:
         return pd.DataFrame()
 
 def save_data(df, sheet_name):
-    if "Status" in df.columns:
-        df = df.drop(columns=["Status"])
-    
-    df = df.fillna("")
-    sheet = get_sheet().worksheet(sheet_name)
-    sheet.clear()
-    
-    data = [df.columns.values.tolist()] + df.values.tolist()
-    sheet.update(values=data, range_name="A1")
+    """Schreibt Daten im Batch-Verfahren (Effizienz-Vorschlag)."""
+    df_to_save = df.drop(columns=["Status", "Color"], errors="ignore").fillna("")
+    ws = get_sheet().worksheet(sheet_name)
+    ws.clear()
+    # Batch Update
+    data = [df_to_save.columns.values.tolist()] + df_to_save.values.tolist()
+    ws.update(values=data, range_name="A1")
+    st.cache_data.clear()
 
 def log_history(aktion, name, marke, menge, einheit, preis):
     try:
-        sheet = get_sheet().worksheet(HISTORY_FILE)
-        datum = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        sheet.append_row([datum, aktion, name, marke, menge, einheit, preis])
-    except Exception as e:
-        print(f"Historie konnte nicht gespeichert werden: {e}")
+        ws = get_sheet().worksheet(HISTORY_FILE)
+        ws.append_row([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), aktion, name, marke, menge, einheit, preis])
+    except: pass
 
-# --- UMRECHNUNGEN & LOGIK ---
-def to_grams(menge, einheit):
-    if einheit in ["kg", "L"]:
-        return float(menge) * 1000.0
-    return float(menge)
-
-def from_grams(menge_g, ziel_einheit):
-    if ziel_einheit in ["kg", "L"]:
-        return float(menge_g) / 1000.0
-    return float(menge_g)
-
-def is_fuzzy_match(search_term, target_term, threshold=0.7):
-    """Prüft, ob zwei Begriffe zu mindestens X% übereinstimmen (z.B. für Zutatenabgleich)."""
-    s1 = str(search_term).lower()
-    s2 = str(target_term).lower()
-    
-    if s1 in s2 or s2 in s1:
-        return True
-        
-    ratio = difflib.SequenceMatcher(None, s1, s2).ratio()
-    return ratio >= threshold
-
-# --- ÜBERSETZER & USDA API ---
-def translate_de_to_en(text):
-    if not TRANSLATOR_AVAILABLE:
-        return text
+# --- INTELLIGENTE LOGIK-ENGINE ---
+def to_grams(m, e, name=""):
+    """Rechnet Einheiten präzise in Gramm um (inkl. Gewichts-Intuition)."""
     try:
-        return GoogleTranslator(source='de', target='en').translate(text)
-    except Exception:
-        return text
+        m = float(m)
+        if e == "Stk.":
+            weight = 100 # Fallback
+            n_lower = str(name).lower()
+            for key, val in STD_WEIGHTS.items():
+                if key in n_lower:
+                    weight = val
+                    break
+            return m * weight
+        return m * 1000.0 if e in ["kg", "L"] else m
+    except: return 0.0
 
-def search_usda(query, api_key):
-    url = f"https://api.nal.usda.gov/fdc/v1/foods/search?api_key={api_key}&query={query}&dataType=Foundation,SR%20Legacy&pageSize=15"
+def from_grams(m, e):
+    """Rechnet Gramm zurück in die Ziel-Einheit."""
     try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            return response.json().get("foods", [])
-    except Exception as e:
-        print("USDA API Search Error:", e)
-    return []
+        m = float(m)
+        return m / 1000.0 if e in ["kg", "L"] else m
+    except: return 0.0
 
-def get_usda_micros(fdc_id, api_key):
-    url = f"https://api.nal.usda.gov/fdc/v1/food/{fdc_id}?api_key={api_key}"
-    usda_map = {
-        1087: "Calcium", 1089: "Eisen", 1090: "Magnesium", 1091: "Phosphor",
-        1092: "Kalium", 1093: "Natrium", 1095: "Zink", 1098: "Kupfer",
-        1101: "Mangan", 1103: "Selen", 1162: "Vit_C", 1165: "B1",
-        1166: "B2", 1167: "B3", 1170: "B5", 1175: "B6", 1177: "B9",
-        1178: "B12", 1106: "Vit_A", 1109: "Vit_E", 1114: "Vit_D", 1185: "Vit_K"
+def is_fuzzy_match(search_term, target_term):
+    """Erkennt Produkte auch bei leicht unterschiedlicher Schreibweise."""
+    s, t = str(search_term).lower(), str(target_term).lower()
+    if s in t or t in s: return True
+    return difflib.SequenceMatcher(None, s, t).ratio() >= 0.7
+
+def predict_category(name):
+    """Automatische Kategorisierung basierend auf Keywords."""
+    keywords = {
+        "Gemüse": ["tomate", "gurke", "zwiebel", "gemüse", "kichererbse", "bohne", "spinat", "brokkoli", "paprika"],
+        "Obst": ["apfel", "banane", "zitrone", "beere", "frucht", "obst", "orange", "mango"],
+        "Milchprodukte": ["milch", "käse", "joghurt", "quark", "sahne", "butter"],
+        "Fleisch": ["huhn", "rind", "schwein", "fleisch", "wurst", "hack", "pute"],
+        "Fisch": ["lachs", "thunfisch", "fisch", "garnele", "forelle"],
+        "Getreide": ["nudel", "reis", "mehl", "brot", "hafer", "quinoa", "couscous"],
+        "Selbstgekocht": ["vorbereitet", "selbstgemacht", "mealprep", "rest"]
     }
-    mapped = {}
+    n_lower = str(name).lower()
+    for cat, words in keywords.items():
+        if any(w in n_lower for w in words): return cat
+    return "Allgemein"
+
+def get_mhd_default(cat):
+    """Berechnet MHD-Vorschlag basierend auf der Kategorie."""
+    days = MHD_DEFAULTS.get(cat, 14)
+    return datetime.now() + timedelta(days=days)
+
+# --- API & NÄHRWERT-SYNCHRONISATION ---
+def fetch_comprehensive_data(barcode, api_key):
+    """Bündelt OFF und USDA für lückenlose Nährwerte."""
+    data = {"Name": "", "Marke": "", "nutrients": {n: 0.0 for n in ALL_NUTRIENTS}}
+    
+    # 1. Open Food Facts (Makros)
     try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            for nutrient in data.get("foodNutrients", []):
-                n_id = nutrient.get("nutrient", {}).get("id")
+        off_r = requests.get(f"https://world.openfoodfacts.org/api/v0/product/{barcode}.json", timeout=5).json()
+        if off_r.get("status") == 1:
+            p = off_r["product"]
+            n = p.get("nutriments", {})
+            data["Name"] = p.get("product_name", "")
+            data["Marke"] = p.get("brands", "")
+            data["nutrients"]["kcal_100"] = n.get("energy-kcal_100g", 0)
+            data["nutrients"]["Prot_100"] = n.get("proteins_100g", 0)
+            data["nutrients"]["Fett_100"] = n.get("fat_100g", 0)
+            data["nutrients"]["Carb_100"] = n.get("carbohydrates_100g", 0)
+            data["nutrients"]["Fiber_100"] = n.get("fiber_100g", 0)
+    except: pass
+
+    # 2. USDA Fallback (Mikros + fehlende Makros)
+    query = data["Name"] if data["Name"] else barcode
+    if query:
+        usda_res = get_usda_data(query, api_key)
+        for k, v in usda_res.items():
+            # Übernehme Wert, wenn OFF nichts geliefert hat
+            if data["nutrients"].get(k, 0) == 0:
+                data["nutrients"][k] = v
+                
+    return data
+
+def get_usda_data(query, api_key):
+    """Holt wissenschaftliche Mikronährstoffe von USDA."""
+    try:
+        search_url = f"https://api.nal.usda.gov/fdc/v1/foods/search?api_key={api_key}&query={query}&dataType=Foundation,SR%20Legacy&pageSize=1"
+        res = requests.get(search_url, timeout=10).json()
+        if res.get("foods"):
+            fdc_id = res["foods"][0]["fdcId"]
+            detail_url = f"https://api.nal.usda.gov/fdc/v1/food/{fdc_id}?api_key={api_key}"
+            details = requests.get(detail_url, timeout=10).json()
+            
+            usda_map = {
+                1008: "kcal_100", 1003: "Prot_100", 1004: "Fett_100", 1005: "Carb_100", 1079: "Fiber_100",
+                1087: "Calcium", 1089: "Eisen", 1090: "Magnesium", 1091: "Phosphor", 1092: "Kalium",
+                1093: "Natrium", 1095: "Zink", 1162: "Vit_C", 1106: "Vit_A", 1109: "Vit_E", 1114: "Vit_D",
+                1165: "B1", 1166: "B2", 1167: "B3", 1170: "B5", 1175: "B6", 1177: "B9", 1178: "B12", 1185: "Vit_K"
+            }
+            results = {}
+            for n in details.get("foodNutrients", []):
+                n_id = n.get("nutrient", {}).get("id")
                 if n_id in usda_map:
-                    mapped[usda_map[n_id]] = float(nutrient.get("amount", 0.0))
-    except Exception as e:
-        print("USDA Fetch Error:", e)
-    return mapped
+                    results[usda_map[n_id]] = float(n.get("amount", 0.0))
+            return results
+    except: pass
+    return {}
 
-def fetch_product_from_api(barcode):
-    url = f"https://world.openfoodfacts.org/api/v0/product/{barcode}.json"
-    try:
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("status") == 1:
-                p = data["product"]
-                n = p.get("nutriments", {})
-                return {
-                    "Name": p.get("product_name", "Unbekannt"), 
-                    "Marke": p.get("brands", ""),
-                    "kcal_100": n.get("energy-kcal_100g", 0), 
-                    "Prot_100": n.get("proteins_100g", 0),
-                    "Fett_100": n.get("fat_100g", 0), 
-                    "Carb_100": n.get("carbohydrates_100g", 0),
-                    "Fiber_100": n.get("fiber_100g", 0), 
-                    "Natrium": n.get("sodium_100g", 0) * 1000 
-                }
-    except Exception:
-        pass
-    return None
-
-def add_to_inventory(inv_df, new_entry):
-    log_history(
-        "Gekauft / Eingelagert", 
-        new_entry.get("Name", ""), 
-        new_entry.get("Marke", ""), 
-        new_entry.get("Menge", 0), 
-        new_entry.get("Einheit", ""), 
-        new_entry.get("Preis", 0)
-    )
-    
-    mask = (inv_df["Name"] == new_entry["Name"]) & (inv_df["Marke"] == new_entry["Marke"])
-    
+# --- BESTANDS- & REZEPT-LOGIK ---
+def add_to_inventory(inv_df, entry):
+    """Stacking von Beständen (Mengen & Kosten)."""
+    mask = (inv_df["Name"] == entry["Name"]) & (inv_df["Marke"] == entry["Marke"])
     if mask.any():
         idx = inv_df[mask].index[0]
-        
-        b_menge_g = to_grams(inv_df.at[idx, "Menge"], inv_df.at[idx, "Einheit"])
-        n_menge_g = to_grams(new_entry["Menge"], new_entry["Einheit"])
-        
-        inv_df.at[idx, "Menge"] = from_grams(b_menge_g + n_menge_g, inv_df.at[idx, "Einheit"])
-        inv_df.at[idx, "MHD"] = new_entry["MHD"]
-        inv_df.at[idx, "Preis"] = float(inv_df.at[idx, "Preis"]) + float(new_entry["Preis"])
+        old_g = to_grams(inv_df.at[idx, "Menge"], inv_df.at[idx, "Einheit"], inv_df.at[idx, "Name"])
+        new_g = to_grams(entry["Menge"], entry["Einheit"], entry["Name"])
+        inv_df.at[idx, "Menge"] = from_grams(old_g + new_g, inv_df.at[idx, "Einheit"])
+        inv_df.at[idx, "Preis"] = float(inv_df.at[idx, "Preis"]) + float(entry["Preis"])
+        inv_df.at[idx, "MHD"] = entry["MHD"]
     else:
-        for n in ALL_NUTRIENTS:
-            if n not in new_entry:
-                new_entry[n] = 0.0
-                
-        inv_df = pd.concat([inv_df, pd.DataFrame([new_entry])], ignore_index=True)
-        
+        inv_df = pd.concat([inv_df, pd.DataFrame([entry])], ignore_index=True)
     return inv_df
 
-def check_pantry(recipe_items_list, inv_df):
-    results = []
+def calculate_recipe_totals(zutaten_liste):
+    """Berechnet Nährwerte & Kosten eines Rezepts und normiert auf 100g."""
+    if not zutaten_liste: return 0, 0, {n: 0.0 for n in ALL_NUTRIENTS}
     
-    for item in recipe_items_list:
-        if item.get("Is_Joker", False):
-            continue
-            
-        req_g = to_grams(item["Menge"], item["Einheit"])
-        avail_g = 0.0
+    total_weight_g = sum([to_grams(z["RezeptMenge"], z["Einheit_Std"], z["Name"]) for z in zutaten_liste])
+    total_cost = 0.0
+    sum_nutrients = {n: 0.0 for n in ALL_NUTRIENTS}
+    
+    for z in zutaten_liste:
+        w_g = to_grams(z["RezeptMenge"], z["Einheit_Std"], z["Name"])
+        # Einkaufswerte aus Bibliothek (Lib-Eintrag ist immer pro Menge_Std normiert)
+        base_g = to_grams(z["Menge_Std"], z["Einheit_Std"], z["Name"])
+        total_cost += (float(z["Preis"]) / base_g) * w_g if base_g > 0 else 0
         
-        for _, row in inv_df.iterrows():
-            if is_fuzzy_match(item["Name"], row["Name"]):
-                avail_g += to_grams(row["Menge"], row["Einheit"])
-                
-        if avail_g >= req_g:
-            results.append({"Zutat": item["Name"], "Status": "🟢 Auf Lager", "Fehlt": "0"})
-        elif avail_g > 0:
-            fehl_g = req_g - avail_g
-            results.append({"Zutat": item["Name"], "Status": "🟡 Teilweise", "Fehlt": f"{from_grams(fehl_g, item['Einheit']):.2f} {item['Einheit']}"})
-        else:
-            results.append({"Zutat": item["Name"], "Status": "🔴 Fehlt komplett", "Fehlt": f"{item['Menge']} {item['Einheit']}"})
+        for n in ALL_NUTRIENTS:
+            # Wert in Lib ist pro 100g -> (Wert/100) * Gramm der Zutat
+            sum_nutrients[n] += (float(z.get(n, 0)) / 100.0) * w_g
             
-    return pd.DataFrame(results)
+    # Normierung des fertigen Gerichts auf 100g
+    nutrients_100g = {n: (val / total_weight_g) * 100.0 if total_weight_g > 0 else 0 for n, val in sum_nutrients.items()}
+    return total_weight_g, total_cost, nutrients_100g
 
-def deduct_cooked_recipe_from_inventory(recipe_items_list, inv_df):
-    """Zieht Zutaten intelligent (Fuzzy Match) nach dem Kochen ab."""
-    for item in recipe_items_list:
-        if item.get("Is_Joker", False):
-            continue
-            
-        req_g = to_grams(item["Menge"], item["Einheit"])
-        
+def deduct_cooked_recipe_from_inventory(zutaten_liste, inv_df):
+    """Bucht Zutaten anteilig inkl. Kosten aus dem Vorrat ab."""
+    for z in zutaten_liste:
+        needed_g = to_grams(z["RezeptMenge"], z["Einheit_Std"], z["Name"])
         for idx, row in inv_df.iterrows():
-            if req_g <= 0:
-                break 
-                
-            if is_fuzzy_match(item["Name"], row["Name"]):
-                akt_menge_g = to_grams(row["Menge"], row["Einheit"])
-                
-                if akt_menge_g > 0:
-                    abzug_g = min(req_g, akt_menge_g)
-                    neu_menge_g = akt_menge_g - abzug_g
-                    req_g -= abzug_g
-                    
-                    inv_df.at[idx, "Menge"] = from_grams(neu_menge_g, row["Einheit"])
-                    log_history(
-                        "Gekocht (Abbuchung)", 
-                        row["Name"], 
-                        row["Marke"], 
-                        -from_grams(abzug_g, row["Einheit"]), 
-                        row["Einheit"], 
-                        0
-                    )
-                    
+            if needed_g <= 0: break
+            if is_fuzzy_match(z["Name"], row["Name"]):
+                avail_g = to_grams(row["Menge"], row["Einheit"], row["Name"])
+                take_g = min(needed_g, avail_g)
+                # Kosten-Deduction: (Aktueller Preis / Gramm) * entnommene Gramm
+                cost_per_g = float(row["Preis"]) / avail_g if avail_g > 0 else 0
+                inv_df.at[idx, "Preis"] = max(0, float(inv_df.at[idx, "Preis"]) - (cost_per_g * take_g))
+                inv_df.at[idx, "Menge"] = from_grams(avail_g - take_g, row["Einheit"])
+                needed_g -= take_g
+                log_history("Verbrauch", row["Name"], row["Marke"], -from_grams(take_g, row["Einheit"]), row["Einheit"], 0)
     return inv_df

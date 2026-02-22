@@ -6,6 +6,7 @@ import streamlit as st
 import difflib
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
+from deep_translator import GoogleTranslator
 
 # ==========================================
 # KONSTANTEN & DATENSTRUKTUR
@@ -21,13 +22,11 @@ ALL_NUTRIENTS = [item for sub in NUTRIENTS.values() for item in sub]
 UNITS = ["g", "kg", "ml", "L", "Stk."]
 
 STD_WEIGHTS = {"zitrone": 60, "ei": 55, "apfel": 150, "banane": 120, "zwiebel": 80, "knoblauch": 5, "kartoffel": 100, "orange": 200, "tomate": 80}
-
-# Erweiterte Kategorien für den Alltag
 KATEGORIEN = ["Gemüse", "Obst", "Milchprodukte", "Fleisch", "Fisch", "Getreide", "Konserve", "Snacks", "Getränke", "Gewürze/Saucen", "Selbstgekocht", "Allgemein"]
 MHD_DEFAULTS = {"Selbstgekocht": 4, "Fleisch": 3, "Fisch": 2, "Gemüse": 7, "Obst": 7, "Milchprodukte": 10, "Getreide": 180, "Konserve": 365, "Snacks": 180, "Getränke": 180, "Gewürze/Saucen": 365, "Allgemein": 14}
 
 # ==========================================
-# GOOGLE SHEETS VERBINDUNG & DB SETUP
+# GOOGLE SHEETS SETUP
 # ==========================================
 @st.cache_resource
 def get_gspread_client():
@@ -96,6 +95,13 @@ def predict_category(name):
         if any(w in str(name).lower() for w in words): return c
     return "Allgemein"
 
+def is_ingredient_match(recipe_name, inv_name):
+    """Smarter Matcher: Erkennt auch 'Ei' in 'Bio Eier', wo die Ratio scheitern würde."""
+    r_lower, i_lower = str(recipe_name).lower(), str(inv_name).lower()
+    if r_lower in i_lower or i_lower in r_lower: 
+        return True
+    return difflib.SequenceMatcher(None, r_lower, i_lower).ratio() >= 0.7
+
 # ==========================================
 # API ENGINE
 # ==========================================
@@ -112,27 +118,34 @@ def fetch_comprehensive_data(barcode, api_key):
                 "Zucker_100": n.get("sugars_100g", 0), "Prot_100": n.get("proteins_100g", 0),
                 "Natrium": n.get("sodium_100g", 0) * 1000
             })
+            
+            # Kcal Fallback-Berechnung, falls API keine Energie, aber Makros liefert
+            if data["nutrients"]["kcal_100"] == 0 and (data["nutrients"]["Prot_100"] > 0 or data["nutrients"]["Carb_100"] > 0):
+                data["nutrients"]["kcal_100"] = (data["nutrients"]["Prot_100"] * 4) + (data["nutrients"]["Carb_100"] * 4) + (data["nutrients"]["Fett_100"] * 9)
     except: pass
-
-    q = data["Name"] if data["Name"] else barcode
-    if q:
-        usda = get_usda_data(q, api_key)
-        for k, v in usda.items():
-            if data["nutrients"].get(k, 0) == 0: data["nutrients"][k] = v
     return data
 
-def get_usda_data(query, api_key):
+def search_usda_list(query_de, api_key):
     try:
-        r = requests.get(f"https://api.nal.usda.gov/fdc/v1/foods/search?api_key={api_key}&query={query}&dataType=Foundation,SR%20Legacy&pageSize=1", timeout=10).json()
+        query_en = GoogleTranslator(source='de', target='en').translate(query_de)
+        url = f"https://api.nal.usda.gov/fdc/v1/foods/search?api_key={api_key}&query={query_en}&dataType=Foundation,SR%20Legacy&pageSize=15"
+        r = requests.get(url, timeout=10).json()
         if r.get("foods"):
-            det = requests.get(f"https://api.nal.usda.gov/fdc/v1/food/{r['foods'][0]['fdcId']}?api_key={api_key}", timeout=10).json()
-            u_map = {1008: "kcal_100", 1003: "Prot_100", 1004: "Fett_100", 1258: "Fett_Sat_100", 1005: "Carb_100", 2000: "Zucker_100", 1087: "Calcium", 1089: "Eisen", 1090: "Magnesium", 1091: "Phosphor", 1092: "Kalium", 1093: "Natrium", 1095: "Zink", 1162: "Vit_C", 1106: "Vit_A", 1109: "Vit_E", 1114: "Vit_D", 1165: "B1", 1166: "B2", 1167: "B3", 1170: "B5", 1175: "B6", 1177: "B9", 1178: "B12"}
-            res = {}
-            for n in det.get("foodNutrients", []):
-                if n.get("nutrient", {}).get("id") in u_map: res[u_map[n["nutrient"]["id"]]] = float(n.get("amount", 0.0))
-            return res
+            return [{"id": f["fdcId"], "desc": f["description"]} for f in r["foods"]]
     except: pass
-    return {}
+    return []
+
+def get_usda_data_by_id(fdc_id, api_key):
+    try:
+        url = f"https://api.nal.usda.gov/fdc/v1/food/{fdc_id}?api_key={api_key}"
+        det = requests.get(url, timeout=10).json()
+        u_map = {1008: "kcal_100", 1003: "Prot_100", 1004: "Fett_100", 1258: "Fett_Sat_100", 1005: "Carb_100", 2000: "Zucker_100", 1087: "Calcium", 1089: "Eisen", 1090: "Magnesium", 1091: "Phosphor", 1092: "Kalium", 1093: "Natrium", 1095: "Zink", 1162: "Vit_C", 1106: "Vit_A", 1109: "Vit_E", 1114: "Vit_D", 1165: "B1", 1166: "B2", 1167: "B3", 1170: "B5", 1175: "B6", 1177: "B9", 1178: "B12"}
+        res = {}
+        for n in det.get("foodNutrients", []):
+            if n.get("nutrient", {}).get("id") in u_map: 
+                res[u_map[n["nutrient"]["id"]]] = float(n.get("amount", 0.0))
+        return res
+    except: return {}
 
 # ==========================================
 # BESTANDS- & REZEPT-LOGIK
@@ -145,9 +158,16 @@ def add_to_inventory(inv_df, entry):
         new_g = to_grams(entry["Menge"], entry["Einheit"], entry["Name"])
         inv_df.at[idx, "Menge"] = from_grams(old_g + new_g, inv_df.at[idx, "Einheit"])
         inv_df.at[idx, "Preis"] = float(inv_df.at[idx, "Preis"]) + float(entry["Preis"])
-        # MHD wird auf das neuere/längere gesetzt
-        inv_df.at[idx, "MHD"] = max(str(inv_df.at[idx, "MHD"]), str(entry["MHD"]))
-    else: inv_df = pd.concat([inv_df, pd.DataFrame([entry])], ignore_index=True)
+        
+        # MHD Sicherheits-Fix: Behalte immer das älteste Datum (min), um Food Waste zu vermeiden!
+        altes_mhd = str(inv_df.at[idx, "MHD"])
+        neues_mhd = str(entry["MHD"])
+        if altes_mhd and neues_mhd:
+            inv_df.at[idx, "MHD"] = min(altes_mhd, neues_mhd)
+        else:
+            inv_df.at[idx, "MHD"] = neues_mhd
+    else: 
+        inv_df = pd.concat([inv_df, pd.DataFrame([entry])], ignore_index=True)
     return inv_df
 
 def delete_inventory_item(inv_df, index): return inv_df.drop(index).reset_index(drop=True)
@@ -179,14 +199,18 @@ def deduct_cooked_recipe_from_inventory(zutaten_liste, inv_df, generate_shopping
         needed_g = to_grams(z["RezeptMenge"], z["Einheit_Std"], z["Name"])
         for idx, row in inv_df.iterrows():
             if needed_g <= 0: break
-            if difflib.SequenceMatcher(None, str(z["Name"]).lower(), str(row["Name"]).lower()).ratio() >= 0.7:
+            
+            # Nutzung des neuen, smarten Matchers
+            if is_ingredient_match(z["Name"], row["Name"]):
                 avail_g = to_grams(row["Menge"], row["Einheit"], row["Name"])
                 take_g = min(needed_g, avail_g)
                 if not generate_shopping_list:
                     cost_per_g = float(row["Preis"]) / avail_g if avail_g > 0 else 0
                     inv_df.at[idx, "Preis"] = max(0, float(inv_df.at[idx, "Preis"]) - (cost_per_g * take_g))
                     inv_df.at[idx, "Menge"] = from_grams(avail_g - take_g, row["Einheit"])
+                
                 needed_g -= take_g
+                
                 if take_g > 0 and not generate_shopping_list:
                     log_history("Verbrauch", row["Name"], row["Marke"], -from_grams(take_g, row["Einheit"]), row["Einheit"], 0)
         

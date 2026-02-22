@@ -5,6 +5,7 @@ import gspread
 import streamlit as st
 from google.oauth2.service_account import Credentials
 from datetime import datetime
+from deep_translator import GoogleTranslator
 
 # --- KONSTANTEN & DATENSTRUKTUR ---
 DB_FILE = "Vorrat"
@@ -41,7 +42,6 @@ def get_sheet():
 
 # --- DATENBANK FUNKTIONEN ---
 def init_dbs():
-    # FIX: Google API Limits schützen! Führt Prüfung nur 1x pro Sitzung durch.
     if "dbs_initialized" in st.session_state:
         return
         
@@ -50,7 +50,6 @@ def init_dbs():
     def init_tab(name, cols):
         try:
             worksheet = sheet.worksheet(name)
-            # Prüfen, ob die Tabelle wirklich ganz leer ist
             if not worksheet.get_all_values(): 
                 worksheet.append_row(cols)
         except gspread.WorksheetNotFound:
@@ -82,24 +81,20 @@ def save_data(df, sheet_name):
     if "Status" in df.columns:
         df = df.drop(columns=["Status"])
     
-    # FIX: NaN-Werte für Google Sheets säubern
     df = df.fillna("")
-    
     sheet = get_sheet().worksheet(sheet_name)
     sheet.clear()
     
     data = [df.columns.values.tolist()] + df.values.tolist()
-    # FIX: Veraltete gspread-Syntax durch aktuelle ersetzt
     sheet.update(values=data, range_name="A1")
 
 def log_history(aktion, name, marke, menge, einheit, preis):
-    """Schreibt einen Log-Eintrag für den 10-Jahres-Tracker."""
     try:
         sheet = get_sheet().worksheet(HISTORY_FILE)
         datum = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         sheet.append_row([datum, aktion, name, marke, menge, einheit, preis])
     except Exception as e:
-        print(f"Historie konnte nicht gespeichert werden: {e}")
+        print(f"Historie Fehler: {e}")
 
 # --- UMRECHNUNGEN & LOGIK ---
 def to_grams(menge, einheit):
@@ -109,6 +104,45 @@ def to_grams(menge, einheit):
 def from_grams(menge_g, ziel_einheit):
     if ziel_einheit in ["kg", "L"]: return float(menge_g) / 1000.0
     return float(menge_g)
+
+# --- NEU: ÜBERSETZER & USDA API ---
+def translate_de_to_en(text):
+    try:
+        return GoogleTranslator(source='de', target='en').translate(text)
+    except:
+        return text
+
+def search_usda(query, api_key):
+    url = f"https://api.nal.usda.gov/fdc/v1/foods/search?api_key={api_key}&query={query}&pageSize=15"
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            return resp.json().get("foods", [])
+    except Exception as e:
+        print("USDA API Search Error:", e)
+    return []
+
+def get_usda_micros(fdc_id, api_key):
+    url = f"https://api.nal.usda.gov/fdc/v1/food/{fdc_id}?api_key={api_key}"
+    usda_map = {
+        1087: "Calcium", 1089: "Eisen", 1090: "Magnesium", 1091: "Phosphor",
+        1092: "Kalium", 1093: "Natrium", 1095: "Zink", 1098: "Kupfer",
+        1101: "Mangan", 1103: "Selen", 1162: "Vit_C", 1165: "B1",
+        1166: "B2", 1167: "B3", 1170: "B5", 1175: "B6", 1177: "B9",
+        1178: "B12", 1106: "Vit_A", 1109: "Vit_E", 1114: "Vit_D", 1185: "Vit_K"
+    }
+    mapped = {}
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            for n in data.get("foodNutrients", []):
+                n_id = n.get("nutrient", {}).get("id")
+                if n_id in usda_map:
+                    mapped[usda_map[n_id]] = float(n.get("amount", 0.0))
+    except Exception as e:
+        print("USDA Fetch Error:", e)
+    return mapped
 
 def fetch_product_from_api(barcode):
     url = f"https://world.openfoodfacts.org/api/v0/product/{barcode}.json"
@@ -134,21 +168,12 @@ def fetch_product_from_api(barcode):
     return None
 
 def add_to_inventory(inv_df, new_entry):
-    log_history(
-        "Gekauft / Eingelagert", 
-        new_entry.get("Name", ""), 
-        new_entry.get("Marke", ""), 
-        new_entry.get("Menge", 0), 
-        new_entry.get("Einheit", ""), 
-        new_entry.get("Preis", 0)
-    )
-    
+    log_history("Gekauft / Eingelagert", new_entry.get("Name", ""), new_entry.get("Marke", ""), new_entry.get("Menge", 0), new_entry.get("Einheit", ""), new_entry.get("Preis", 0))
     mask = (inv_df["Name"] == new_entry["Name"]) & (inv_df["Marke"] == new_entry["Marke"])
     if mask.any():
         idx = inv_df[mask].index[0]
         b_menge_g = to_grams(inv_df.at[idx, "Menge"], inv_df.at[idx, "Einheit"])
         n_menge_g = to_grams(new_entry["Menge"], new_entry["Einheit"])
-        
         inv_df.at[idx, "Menge"] = from_grams(b_menge_g + n_menge_g, inv_df.at[idx, "Einheit"])
         inv_df.at[idx, "MHD"] = new_entry["MHD"]
         inv_df.at[idx, "Preis"] = new_entry["Preis"]
@@ -164,10 +189,8 @@ def check_pantry(recipe_items_list, inv_df):
     for item in recipe_items_list:
         if item.get("Is_Joker", False):
             continue
-            
         req_g = to_grams(item["Menge"], item["Einheit"])
         match = inv_df[inv_df["Name"].str.contains(item["Name"], case=False, na=False)]
-        
         if not match.empty:
             avail_g = sum([to_grams(row["Menge"], row["Einheit"]) for _, row in match.iterrows()])
             if avail_g >= req_g:

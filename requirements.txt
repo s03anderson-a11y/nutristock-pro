@@ -6,3 +6,4 @@ google-auth
 pyzbar
 Pillow
 plotly
+deep-translator

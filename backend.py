@@ -43,7 +43,7 @@ def init_dbs():
         try:
             ws = sheet.worksheet(name)
             if not ws.row_values(1): ws.insert_row(cols, index=1)
-        except gspread.exceptions.WorksheetNotFound: 
+        except Exception: # Generischer Catch für fehlende Arbeitsblätter
             sheet.add_worksheet(title=name, rows="1000", cols="50").insert_row(cols, index=1)
     
     init_tab(LIB_FILE, ["Name", "Marke", "Kategorie", "Menge_Std", "Einheit_Std", "Preis"] + ALL_NUTRIENTS)
@@ -58,7 +58,9 @@ def load_data(sheet_name):
         ws = get_sheet().worksheet(sheet_name)
         records = ws.get_all_records()
         return pd.DataFrame(records).fillna(0.0) if records else pd.DataFrame(columns=ws.row_values(1))
-    except: return pd.DataFrame()
+    except Exception as e:
+        print(f"Ladefehler {sheet_name}: {e}")
+        return pd.DataFrame()
 
 def save_data(df, sheet_name):
     df_to_save = df.drop(columns=["Status", "Color"], errors="ignore").fillna("")
@@ -72,8 +74,13 @@ def log_history(aktion, name, marke, menge, einheit, preis):
     except: pass
 
 # ==========================================
-# HILFS-LOGIK (Repariert für "Stück" Bug)
+# HILFS-LOGIK & MATCHING
 # ==========================================
+def safe_float(val):
+    """Verhindert Abstürze durch leere Strings oder None aus externen APIs."""
+    try: return float(val) if val else 0.0
+    except: return 0.0
+
 def to_grams(m, e, name=""):
     try:
         m = float(m)
@@ -86,7 +93,6 @@ def to_grams(m, e, name=""):
     except: return 0.0
 
 def from_grams(m_g, e, name=""):
-    """Rechnet Gramm wieder in die Standardeinheit zurück."""
     try:
         m_g = float(m_g)
         if e == "Stk.":
@@ -116,10 +122,13 @@ def fetch_comprehensive_data(barcode, api_key):
             p, n = off["product"], off["product"].get("nutriments", {})
             data["Name"], data["Marke"] = p.get("product_name", ""), p.get("brands", "")
             data["nutrients"].update({
-                "kcal_100": n.get("energy-kcal_100g", 0), "Fett_100": n.get("fat_100g", 0), 
-                "Fett_Sat_100": n.get("saturated-fat_100g", 0), "Carb_100": n.get("carbohydrates_100g", 0), 
-                "Zucker_100": n.get("sugars_100g", 0), "Prot_100": n.get("proteins_100g", 0),
-                "Natrium": n.get("sodium_100g", 0) * 1000
+                "kcal_100": safe_float(n.get("energy-kcal_100g", 0)), 
+                "Fett_100": safe_float(n.get("fat_100g", 0)), 
+                "Fett_Sat_100": safe_float(n.get("saturated-fat_100g", 0)), 
+                "Carb_100": safe_float(n.get("carbohydrates_100g", 0)), 
+                "Zucker_100": safe_float(n.get("sugars_100g", 0)), 
+                "Prot_100": safe_float(n.get("proteins_100g", 0)),
+                "Natrium": safe_float(n.get("sodium_100g", 0)) * 1000
             })
             if data["nutrients"]["kcal_100"] == 0 and (data["nutrients"]["Prot_100"] > 0 or data["nutrients"]["Carb_100"] > 0):
                 data["nutrients"]["kcal_100"] = (data["nutrients"]["Prot_100"] * 4) + (data["nutrients"]["Carb_100"] * 4) + (data["nutrients"]["Fett_100"] * 9)
@@ -144,7 +153,7 @@ def get_usda_data_by_id(fdc_id, api_key):
         res = {}
         for n in det.get("foodNutrients", []):
             if n.get("nutrient", {}).get("id") in u_map: 
-                res[u_map[n["nutrient"]["id"]]] = float(n.get("amount", 0.0))
+                res[u_map[n["nutrient"]["id"]]] = safe_float(n.get("amount", 0.0))
         return res
     except: return {}
 

@@ -13,7 +13,6 @@ from deep_translator import GoogleTranslator
 # ==========================================
 DB_FILE, LIB_FILE, RECIPE_FILE, HISTORY_FILE = "Vorrat", "Bibliothek", "Rezepte", "Historie"
 
-# EU-Deklaration (Big 7) + Mikros
 NUTRIENTS = {
     "Makronährstoffe": ["kcal_100", "Fett_100", "Fett_Sat_100", "Carb_100", "Zucker_100", "Prot_100"],
     "Vitamine": ["Vit_A", "Vit_D", "Vit_E", "Vit_K", "Vit_C", "B1", "B2", "B3", "B5", "B6", "B7", "B9", "B12"],
@@ -22,10 +21,7 @@ NUTRIENTS = {
 ALL_NUTRIENTS = [item for sub in NUTRIENTS.values() for item in sub]
 UNITS = ["g", "kg", "ml", "L", "Stk."]
 
-# Intuitive Gewichte für Stückangaben
 STD_WEIGHTS = {"zitrone": 60, "ei": 55, "apfel": 150, "banane": 120, "zwiebel": 80, "knoblauch": 5, "kartoffel": 100, "orange": 200, "tomate": 80}
-
-# Kategorien & Haltbarkeit
 KATEGORIEN = ["Gemüse", "Obst", "Milchprodukte", "Fleisch", "Fisch", "Getreide", "Konserve", "Snacks", "Getränke", "Gewürze/Saucen", "Selbstgekocht", "Allgemein"]
 MHD_DEFAULTS = {"Selbstgekocht": 4, "Fleisch": 3, "Fisch": 2, "Gemüse": 7, "Obst": 7, "Milchprodukte": 10, "Getreide": 180, "Konserve": 365, "Snacks": 180, "Getränke": 180, "Gewürze/Saucen": 365, "Allgemein": 14}
 
@@ -62,9 +58,7 @@ def load_data(sheet_name):
         ws = get_sheet().worksheet(sheet_name)
         records = ws.get_all_records()
         return pd.DataFrame(records).fillna(0.0) if records else pd.DataFrame(columns=ws.row_values(1))
-    except Exception as e:
-        print(f"Ladefehler {sheet_name}: {e}")
-        return pd.DataFrame()
+    except: return pd.DataFrame()
 
 def save_data(df, sheet_name):
     df_to_save = df.drop(columns=["Status", "Color"], errors="ignore").fillna("")
@@ -78,7 +72,7 @@ def log_history(aktion, name, marke, menge, einheit, preis):
     except: pass
 
 # ==========================================
-# HILFS-LOGIK & MATCHING
+# HILFS-LOGIK (Repariert für "Stück" Bug)
 # ==========================================
 def to_grams(m, e, name=""):
     try:
@@ -91,38 +85,30 @@ def to_grams(m, e, name=""):
         return m * 1000.0 if e in ["kg", "L"] else m
     except: return 0.0
 
-def from_grams(m, e):
-    try: return float(m) / 1000.0 if e in ["kg", "L"] else float(m)
+def from_grams(m_g, e, name=""):
+    """Rechnet Gramm wieder in die Standardeinheit zurück."""
+    try:
+        m_g = float(m_g)
+        if e == "Stk.":
+            w = 100
+            for k, v in STD_WEIGHTS.items():
+                if k in str(name).lower(): w = v; break
+            return m_g / w
+        return m_g / 1000.0 if e in ["kg", "L"] else m_g
     except: return 0.0
 
-def predict_category(name):
-    cats = {"Gemüse": ["tomate", "gurke", "zwiebel", "gemüse", "kichererbse", "bohne", "spinat", "brokkoli"], "Obst": ["apfel", "banane", "zitrone", "beere", "frucht", "orange"], "Milchprodukte": ["milch", "käse", "joghurt", "quark", "sahne"], "Fleisch": ["huhn", "rind", "schwein", "fleisch", "wurst"], "Fisch": ["lachs", "thunfisch", "fisch"], "Getreide": ["nudel", "reis", "mehl", "brot", "hafer"], "Konserve": ["dose", "konserve"], "Snacks": ["riegel", "chips", "schokolade", "snack"], "Getränke": ["wasser", "saft", "cola", "getränk"], "Gewürze/Saucen": ["salz", "pfeffer", "sauce", "ketchup", "öl", "essig"]}
-    for c, words in cats.items():
-        if any(w in str(name).lower() for w in words): return c
-    return "Allgemein"
-
 def is_ingredient_match(recipe_name, inv_name):
-    """Sicherer Matcher: Verhindert, dass 'Ei' fälschlicherweise in 'Weizenmehl' gefunden wird."""
     r_str, i_str = str(recipe_name).lower(), str(inv_name).lower()
-    
-    # 1. Exakter Match
     if r_str == i_str: return True
-    
-    # 2. Buchstabendreher / Tippfehler (z.B. Tomaten vs Tomate)
     if difflib.SequenceMatcher(None, r_str, i_str).ratio() >= 0.75: return True
-    
-    # 3. Sichere Wort-für-Wort Prüfung (Erkennt "Ei" in "Bio Ei")
-    r_words = set(r_str.replace(",", "").split())
-    i_words = set(i_str.replace(",", "").split())
+    r_words, i_words = set(r_str.replace(",", "").split()), set(i_str.replace(",", "").split())
     if r_words.issubset(i_words) or i_words.issubset(r_words): return True
-    
     return False
 
 # ==========================================
 # API ENGINE (OFF + USDA)
 # ==========================================
 def fetch_comprehensive_data(barcode, api_key):
-    """Holt Verpackungsdaten via OpenFoodFacts mit Kalorien-Fallback."""
     data = {"Name": "", "Marke": "", "nutrients": {n: 0.0 for n in ALL_NUTRIENTS}}
     try:
         off = requests.get(f"https://world.openfoodfacts.org/api/v0/product/{barcode}.json", timeout=5).json()
@@ -135,26 +121,22 @@ def fetch_comprehensive_data(barcode, api_key):
                 "Zucker_100": n.get("sugars_100g", 0), "Prot_100": n.get("proteins_100g", 0),
                 "Natrium": n.get("sodium_100g", 0) * 1000
             })
-            # Kcal Fallback (Berechnung aus Makros, falls API keine Energie liefert)
             if data["nutrients"]["kcal_100"] == 0 and (data["nutrients"]["Prot_100"] > 0 or data["nutrients"]["Carb_100"] > 0):
                 data["nutrients"]["kcal_100"] = (data["nutrients"]["Prot_100"] * 4) + (data["nutrients"]["Carb_100"] * 4) + (data["nutrients"]["Fett_100"] * 9)
     except: pass
     return data
 
 def search_usda_list(query_de, api_key):
-    """Übersetzt Deutsch -> Englisch und sucht in der USDA Foundation/SR Legacy."""
     try:
         query_en = GoogleTranslator(source='de', target='en').translate(query_de)
         url = f"https://api.nal.usda.gov/fdc/v1/foods/search?api_key={api_key}&query={query_en}&dataType=Foundation,SR%20Legacy&pageSize=15"
         r = requests.get(url, timeout=10).json()
         if r.get("foods"):
             return [{"id": f["fdcId"], "desc": f["description"]} for f in r["foods"]]
-    except Exception as e: 
-        print(f"USDA Search Error: {e}")
+    except: pass
     return []
 
 def get_usda_data_by_id(fdc_id, api_key):
-    """Holt die exakten Mikronährstoffe für eine USDA-ID."""
     try:
         url = f"https://api.nal.usda.gov/fdc/v1/food/{fdc_id}?api_key={api_key}"
         det = requests.get(url, timeout=10).json()
@@ -175,28 +157,20 @@ def add_to_inventory(inv_df, entry):
         idx = inv_df[mask].index[0]
         old_g = to_grams(inv_df.at[idx, "Menge"], inv_df.at[idx, "Einheit"], inv_df.at[idx, "Name"])
         new_g = to_grams(entry["Menge"], entry["Einheit"], entry["Name"])
-        inv_df.at[idx, "Menge"] = from_grams(old_g + new_g, inv_df.at[idx, "Einheit"])
+        inv_df.at[idx, "Menge"] = from_grams(old_g + new_g, inv_df.at[idx, "Einheit"], inv_df.at[idx, "Name"])
         inv_df.at[idx, "Preis"] = float(inv_df.at[idx, "Preis"]) + float(entry["Preis"])
-        
-        # Sicherstellen, dass das älteste MHD gewinnt (Food Waste Vermeidung)
-        altes_mhd = str(inv_df.at[idx, "MHD"])
-        neues_mhd = str(entry["MHD"])
-        if altes_mhd and neues_mhd:
-            inv_df.at[idx, "MHD"] = min(altes_mhd, neues_mhd)
-        else:
-            inv_df.at[idx, "MHD"] = neues_mhd
+        altes_mhd, neues_mhd = str(inv_df.at[idx, "MHD"]), str(entry["MHD"])
+        inv_df.at[idx, "MHD"] = min(altes_mhd, neues_mhd) if altes_mhd and neues_mhd else neues_mhd
     else: 
         inv_df = pd.concat([inv_df, pd.DataFrame([entry])], ignore_index=True)
     return inv_df
 
-def delete_inventory_item(inv_df, index): 
-    return inv_df.drop(index).reset_index(drop=True)
+def delete_inventory_item(inv_df, index): return inv_df.drop(index).reset_index(drop=True)
 
 def update_inventory_item(inv_df, index, new_menge):
     old_menge = float(inv_df.at[index, "Menge"])
     inv_df.at[index, "Menge"] = new_menge
-    if old_menge > 0: 
-        inv_df.at[index, "Preis"] = (float(inv_df.at[index, "Preis"]) / old_menge) * float(new_menge)
+    if old_menge > 0: inv_df.at[index, "Preis"] = (float(inv_df.at[index, "Preis"]) / old_menge) * float(new_menge)
     return inv_df
 
 def calculate_recipe_totals(zutaten_liste):
@@ -227,17 +201,16 @@ def deduct_cooked_recipe_from_inventory(zutaten_liste, inv_df, generate_shopping
                 if not generate_shopping_list:
                     cost_per_g = float(row["Preis"]) / avail_g if avail_g > 0 else 0
                     inv_df.at[idx, "Preis"] = max(0, float(inv_df.at[idx, "Preis"]) - (cost_per_g * take_g))
-                    inv_df.at[idx, "Menge"] = from_grams(avail_g - take_g, row["Einheit"])
+                    inv_df.at[idx, "Menge"] = from_grams(avail_g - take_g, row["Einheit"], row["Name"])
                 
                 needed_g -= take_g
                 if take_g > 0 and not generate_shopping_list:
-                    log_history("Verbrauch (Rezept/Quick)", row["Name"], row["Marke"], -from_grams(take_g, row["Einheit"]), row["Einheit"], 0)
+                    log_history("Verbrauch", row["Name"], row["Marke"], -from_grams(take_g, row["Einheit"], row["Name"]), row["Einheit"], 0)
         
         if needed_g > 0 and generate_shopping_list:
-            shopping_list.append({"Name": z["Name"], "Fehlmenge": from_grams(needed_g, z["Einheit_Std"]), "Einheit": z["Einheit_Std"]})
+            shopping_list.append({"Name": z["Name"], "Fehlmenge": from_grams(needed_g, z["Einheit_Std"], z["Name"]), "Einheit": z["Einheit_Std"]})
             
     if not generate_shopping_list:
-        # ZOMBIE-CLEANUP: Löscht alle Einträge restlos, die unter 0.01g gefallen sind.
         inv_df["Menge"] = pd.to_numeric(inv_df["Menge"], errors="coerce").fillna(0)
         inv_df = inv_df[inv_df["Menge"] > 0.01].reset_index(drop=True)
         
